@@ -1,0 +1,23 @@
+[project]
+name = "voice-vec"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "duckdb>=1.5.5",
+    "fastapi>=0.141.1",
+    "fastembed>=0.8.0",
+    # Every provider call on the voice path is a streamed one; httpx is the
+    # client that does that without buffering the whole body first.
+    "httpx>=0.28.1",
+    "pydantic-settings>=2.15.0",
+    # FastAPI needs this to read the multipart upload on /voice/transcribe.
+    "python-multipart>=0.0.20",
+    "qdrant-client>=1.19.0",
+    "uvicorn[standard]>=0.52.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
