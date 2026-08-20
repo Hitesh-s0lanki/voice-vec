@@ -1,0 +1,24 @@
+{
+  "collection": "vec-chunks",
+  "model": "intfloat/multilingual-e5-small",
+  "dim": 384,
+  "strategies": [
+    "S1"
+  ],
+  "languages": [
+    "hin_Deva"
+  ],
+  "rows": 2000,
+  "passages": 19987,
+  "chunks": 19870,
+  "dedup_rate": 0.0059,
+  "token_p99": 226,
+  "elapsed_seconds": 723.3,
+  "source": "data/hinval-2000.parquet",
+  "built_at": "2026-08-19T09:38:45+00:00",
+  "extras": {
+    "answerable_rows": 1219,
+    "unanswerable_rows": 781,
+    "at_token_cap": 60
+  }
+}
