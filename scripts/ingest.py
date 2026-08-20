@@ -1,4 +1,4 @@
-"""Build the index: parquet → chunks → embeddings → Qdrant.
+"""Build the index: parquet → chunks → embeddings → Postgres.
 
     uv run python -m scripts.ingest --rows 2000
 
@@ -11,8 +11,10 @@ v1 ingests S1 (passage-atomic) only. Phase B adds S2–S5 and re-runs this with
 re-run overwrites rather than duplicating and a crashed run resumes by
 repeating itself.
 
-Embedded Qdrant is a single-writer store: stop the API before ingesting, or
-point both at a Qdrant server with QDRANT_URL.
+Writes to Postgres (`DATABASE_URL`), which unlike the embedded store it
+replaced takes concurrent writers — the API can keep serving while this runs.
+The HNSW and GIN indexes are built at the end, once, rather than maintained
+across every insert.
 """
 
 from __future__ import annotations
@@ -102,7 +104,7 @@ def main() -> None:
     )
     parser.add_argument("--strategies", default=ChunkStrategy.PASSAGE.value)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--recreate", action="store_true", help="drop the collection first")
+    parser.add_argument("--recreate", action="store_true", help="drop the table first")
     args = parser.parse_args()
 
     source = args.source or (str(DEFAULT_CACHE) if DEFAULT_CACHE.exists() else HF_URL)
@@ -165,7 +167,7 @@ def main() -> None:
         chunks = [chunk for _, chunk in sorted(zip(lengths, chunks), key=lambda pair: pair[0])]
 
     store = get_store()
-    store.ensure_collection(embedder.dim, recreate=args.recreate)
+    store.ensure_schema(embedder.dim, recreate=args.recreate)
     print(f"upserting into {store.collection} at {store.location}")
 
     embedding_started = time.perf_counter()
@@ -184,9 +186,17 @@ def main() -> None:
             flush=True,
         )
 
+    # After the rows land, never alongside them: an HNSW graph maintained
+    # across every insert costs far more than one built over a populated table,
+    # and nothing queries the index until ingest is done.
+    print("\nbuilding indexes (hnsw, gin)")
+    index_started = time.perf_counter()
+    store.create_indexes()
+    print(f"  built in {time.perf_counter() - index_started:.1f}s")
+
     elapsed = time.perf_counter() - started
     total = store.count()
-    print(f"\nindexed {total} points in {elapsed:.1f}s")
+    print(f"indexed {total} points in {elapsed:.1f}s")
 
     IndexManifest(
         collection=store.collection,

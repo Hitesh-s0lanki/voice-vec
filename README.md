@@ -52,16 +52,26 @@ exposed by that: Sarvam and OpenAI are only ever called from the Python side.
 <details>
 <summary>Turning retrieval back on</summary>
 
+Retrieval needs a Postgres with `pgvector`. Neon, or locally:
+
 ```bash
+docker run -d --name vec-pg -p 5432:5432 -e POSTGRES_PASSWORD=vec \
+  -e POSTGRES_USER=vec -e POSTGRES_DB=vec pgvector/pgvector:pg17
+```
+
+```bash
+uv run python -m scripts.migrate                # check the DSN, report the round trip
 uv run python -m scripts.ingest --rows 2000 --recreate
 uv run python -m scripts.suggestions --n 12     # with the API running
 # then set RAG_ENABLED=true and restart
 ```
 
 The first ingest downloads ~9 MB of MSMARCO-XI rows and the embedding model, then embeds
-~17k passages. Qdrant runs **in-process** over `data/qdrant`, which is a single-writer
-lock: stop the API before re-ingesting, or set `QDRANT_URL` and run both against a Qdrant
-server.
+~17k passages — about 12 minutes, all of it local CPU. Run `migrate` first: it costs a
+second and catches a wrong DSN or a too-distant region before the embedding does.
+
+Postgres takes concurrent writers, so ingest and the API can run together. The HNSW and
+GIN indexes are built once at the end of ingest rather than maintained per insert.
 
 </details>
 

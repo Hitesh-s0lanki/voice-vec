@@ -65,8 +65,8 @@ def evaluate(rows, n: int, seed: int) -> dict:
 
         vector = embedder.embed_query(query)
         # No language filter, for the same reason the service skips it: the
-        # index holds one language, so the filter cannot change the results and
-        # embedded Qdrant charges ~90 ms to evaluate it.
+        # index holds one language, so the filter cannot change the results —
+        # and on a filtered ANN search it still costs candidates.
         hits = store.search(vector, strategies=settings.search_strategies, limit=10)
 
         gold_rank = None

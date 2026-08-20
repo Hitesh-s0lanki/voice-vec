@@ -53,7 +53,7 @@ async def lifespan(app: FastAPI):
 
     None of it runs with retrieval off. The voice loop calls no local model, so
     warming a 465 MB ONNX session it will not use costs seconds of boot and
-    holds the Qdrant path open against `scripts/ingest.py` for nothing.
+    holds a pool open against a database this build never queries.
     """
     settings = get_settings()
     store: VectorStore | None = None

@@ -14,7 +14,7 @@ case it claims to be rather than an example chosen because it worked:
   5. unsafe input            — Gate 1 refuses
   6. spoken prompt injection — Gate 1 strips the imperative and answers the rest
 
-Runs in-process, so stop the API first (embedded Qdrant is a single-writer store).
+Runs in-process against the same database as the API; both can be up at once.
 """
 
 from __future__ import annotations

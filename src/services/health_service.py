@@ -24,8 +24,8 @@ class HealthService:
         balancer nothing, and "the index is empty" is exactly the state you
         want to see reported before you go looking for it in the logs.
         """
-        # Counting means connecting, and with retrieval off that would open
-        # the Qdrant path this build never reads — and lock it against ingest.
+        # Counting means connecting, and with retrieval off that would open a
+        # connection pool against a database this build never reads.
         if self._settings.rag_enabled:
             try:
                 chunks = self._store.count()
