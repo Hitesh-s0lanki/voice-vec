@@ -1,28 +1,50 @@
 """The RAG pipeline: transcript in, grounded answer or honest abstention out.
 
-Tier 1 of the ladder in docs/02-architecture.md — embed, search, extract, with
-a gate before and after. Zero network calls after the transcript arrives, which
-is the only reason 200 ms is reachable at all.
+One entry point, five rungs (`src/rag/effort.py`, docs/15-effort.md). The rung
+is a **ceiling**: it says how far the pipeline *may* escalate, never how far it
+must. A question the answer cache already holds is answered from Redis at rung
+4 exactly as it would be at rung 1, and `AskResponse.tier` reports the rung that
+actually produced the answer against `mode`, which reports the one that was
+asked for.
 
-Tiers 2 (cross-encoder rerank) and 3 (LLM synthesis) are not in v1. The stage
-slots and their timing keys exist so adding them does not reshape the contract.
+    0 lookup      guard → embed → search → guard          no LLM, ~60 ms
+    1 grounded    + cache, extractive span, Gate 3        no LLM, < 200 ms
+    2 deep        + hybrid, rerank, synthesis, Gate 4     1 call
+    3 corrective  + relevance grading, rewrite, retry     3-6 calls
+    4 adaptive    + routing, capped repair loop           4-8 calls
+
+The straight line through the middle is the same at every rung, which is what
+keeps this one function rather than five pipelines that drift: retrieval,
+Gate 2 and the citation shape are shared, and the rung decides which optional
+stages hang off them.
+
+**Every rung degrades rather than failing.** A connected Pinecone has no lexical
+channel, so rung 2 runs dense-only and says `dense-only` in `escalations`. No
+model key, so synthesis is unavailable and rung 2 falls back to the extractive
+answer of rung 1 and reports `tier: 1`. Redis is down, so the cache is a miss.
+None of those are errors at the user, and none of them are silent.
 """
 
 from __future__ import annotations
 
 import uuid
 
+import numpy as np
+
 from src.core.config import Settings, get_settings
-from src.rag import guardrails
+from src.rag import agents, effort, fuse, guardrails
+from src.rag.backends.base import Capabilities, VectorBackend
+from src.rag.backends.resolve import BackendResolver, get_resolver
+from src.rag.cache import AnswerCache, Scope, get_cache
 from src.rag.embed import Embedder, get_embedder
 from src.rag.extract import Extraction, extract_span
 from src.rag.harness import Abstain, Ctx, Harness, Refuse
-from src.rag.manifest import indexed_languages
-from src.rag.store import Hit, StoreUnavailable, VectorStore, get_store
+from src.rag.manifest import indexed_languages, read_manifest
+from src.rag.rerank import rerank
+from src.rag.store import Hit, StoreUnavailable
 from src.schemas.ask import AskRequest, AskResponse, Citation, Timings
 from src.services.metrics_service import MetricsService, get_metrics_service
 
-TIER = 1
 MAX_CITATIONS = 3
 
 
@@ -31,88 +53,262 @@ class AskService:
         self,
         settings: Settings,
         embedder: Embedder,
-        store: VectorStore,
+        resolver: BackendResolver,
         metrics: MetricsService,
+        cache: AnswerCache,
     ) -> None:
         self._settings = settings
         self._embedder = embedder
-        self._store = store
+        self._resolver = resolver
         self._metrics = metrics
+        self._cache = cache
 
-    def ask(self, request: AskRequest) -> AskResponse:
+    # ---- the pipeline ----------------------------------------------------
+
+    def ask(self, request: AskRequest, *, user_id: str | None = None) -> AskResponse:
         settings = self._settings
+        level = settings.effort_level(request.effort)
         ctx = Ctx(
             request_id=request.request_id or str(uuid.uuid4()),
             language=None,
-            effort=request.effort,
-            deadline_ms=settings.deadline_ms,
+            effort=level,
+            # Each rung against its own budget. A shared 200 ms would make the
+            # harness skip every optional stage on rungs 2-4 — including the
+            # graders those rungs exist to run.
+            deadline_ms=settings.deadline_for(level),
         )
         harness = Harness(ctx)
+        run = _Run(
+            request=request, level=level, ctx=ctx, harness=harness, settings=settings
+        )
 
         if not settings.rag_enabled:
             # Retrieval is switched off for the voice build. Abstaining is both
             # honest and already part of the contract — better than searching an
             # index that was never warmed and reporting whatever comes back.
             return self._respond(
-                harness,
+                run,
                 status="abstained",
                 answer=None,
                 citations=[],
                 confidence=0.0,
                 reason="Retrieval is switched off — set RAG_ENABLED=true to search the corpus.",
-                flags=[],
                 tier=0,
             )
 
-        verdict: guardrails.InputVerdict | None = None
-        hits: list[Hit] = []
-        confidence = 0.0
-
         try:
-            verdict = harness.stage(
-                "guard_in",
-                lambda: guardrails.gate_input(
-                    request.transcript,
-                    request.language_code,
-                    settings,
-                    indexed_languages(),
-                ),
+            self._gate_input(run)
+            self._embed(run)
+
+            cached = self._from_cache(run, user_id)
+            if cached is not None:
+                return cached
+
+            if effort.uses_routing(level):
+                self._route(run)
+
+            self._resolve_backend(run, user_id)
+            self._retrieve(run)
+            self._gate_retrieval(run)
+
+            if effort.uses_rerank(level):
+                self._rerank(run)
+
+            if effort.uses_grading(level):
+                self._grade_retrieval(run)
+
+            response = self._answer(run)
+            self._to_cache(run, user_id, response)
+            return response
+
+        except Refuse as refusal:
+            return self._respond(
+                run,
+                status="refused",
+                answer=None,
+                citations=[],
+                confidence=0.0,
+                reason=refusal.reason,
+                tier=0,
             )
-            assert verdict is not None
-            ctx.language = verdict.language
-
-            if verdict.status == "refused":
-                raise Refuse(verdict.reason or "I can't help with that.")
-            if verdict.status == "abstained":
-                raise Abstain(verdict.reason or "I don't have that in my sources.")
-
-            query_vector = harness.stage(
-                "embed",
-                lambda: self._embedder.embed_query(verdict.query),
+        except Abstain as abstention:
+            return self._respond(
+                run,
+                status="abstained",
+                answer=None,
+                # The near misses: what was found and rejected. `status` already
+                # says nothing was answered, and seeing them is what makes an
+                # abstention inspectable rather than a shrug.
+                citations=self._citations(None, run),
+                confidence=abstention.confidence or run.confidence,
+                reason=abstention.reason,
             )
-            assert query_vector is not None
+        except Exception as error:  # degradation matrix: never 500 at the user
+            ctx.trace.append({"unhandled": f"{type(error).__name__}: {error}"})
+            return self._respond(
+                run,
+                status="refused",
+                answer=None,
+                citations=[],
+                confidence=0.0,
+                reason="Something went wrong on my side — try that again.",
+                tier=0,
+            )
 
-            # Filter by language only when the index actually holds more than
-            # one. Filtering on the sole indexed value cannot change the result
-            # set, and on a filtered ANN search it can actively hurt: pgvector
-            # discards non-matching rows *while* walking the HNSW graph, so a
-            # predicate that excludes nothing still costs candidates. Cheap to
-            # keep, so it stays for the day a second language is indexed.
-            languages = indexed_languages()
-            filter_language = verdict.language if len(languages) > 1 else None
+    # ---- stages ----------------------------------------------------------
 
-            def search() -> list[Hit]:
-                return self._store.search(
-                    query_vector,
-                    strategies=settings.search_strategies,
-                    limit=settings.search_limit,
-                    language=filter_language,
-                )
+    def _gate_input(self, run: _Run) -> None:
+        verdict = run.harness.stage(
+            "guard_in",
+            lambda: guardrails.gate_input(
+                run.request.transcript,
+                run.request.language_code,
+                self._settings,
+                indexed_languages(),
+            ),
+        )
+        assert verdict is not None
+        run.verdict = verdict
+        run.ctx.language = verdict.language
 
-            def unavailable(error: BaseException) -> list[Hit]:
-                raise Abstain("My sources are unavailable right now.") from error
+        if verdict.status == "refused":
+            raise Refuse(verdict.reason or "I can't help with that.")
+        if verdict.status == "abstained":
+            raise Abstain(verdict.reason or "I don't have that in my sources.")
 
-            hits = harness.stage(
+        # Asked in a language the index does not hold. Gate 1 routes rather
+        # than refuses (see the language block there): search unfiltered, score
+        # against a floor set for cross-lingual cosines, and answer from the
+        # original English each chunk carries.
+        run.english = verdict.cross_lingual
+
+    def _embed(self, run: _Run) -> None:
+        vector = run.harness.stage(
+            "embed",
+            lambda: self._embedder.embed_query(run.query),
+        )
+        assert vector is not None
+        run.query_vector = vector
+
+    def _route(self, run: _Run) -> None:
+        """Adaptive RAG's pre-retrieval router.
+
+        The one stage that can save the *entire* pipeline rather than improve
+        it: "hello" and "what did I just ask you" are questions no corpus
+        search can help with, and retrieving for them spends the budget to
+        produce an abstention that was knowable up front.
+
+        A router that cannot answer routes to the vector store. That is the
+        conservative direction — retrieving unnecessarily costs latency,
+        skipping retrieval wrongly costs the answer.
+        """
+        decision = run.harness.stage(
+            "route",
+            lambda: agents.route(
+                query=run.query,
+                settings=self._settings,
+                corpus=self._corpus_hint(),
+            ),
+            optional=True,
+        )
+        if decision is None:
+            run.ctx.trace.append({"route": "unavailable", "to": "vectorstore"})
+            return
+
+        run.ctx.trace.append({"route": decision.destination, "why": decision.reason})
+        if decision.destination == "direct":
+            # Not an abstention about the corpus — a statement that the corpus
+            # was never the right place to look. The `direct` flag is what the
+            # voice loop reads to answer conversationally instead of reading
+            # out "no source covers this".
+            run.escalations.append("routed-direct")
+            run.direct = True
+            raise Abstain("That isn't something my sources cover.")
+
+    def _resolve_backend(self, run: _Run, user_id: str | None) -> None:
+        """Whose vectors these are.
+
+        A user who connected Pinecone, Astra or their own Postgres is searched
+        against that; everybody else gets the deployment's store
+        (docs/13-connectors.md). Resolved per call rather than held on the
+        service, because the service is a singleton and the answer differs per
+        caller.
+        """
+        if run.store is not None:
+            return  # the cache stage already resolved it; the answer is per-user
+
+        store = self._resolver.for_user(user_id)
+        run.store = store
+        try:
+            run.caps = store.capabilities()
+        except Exception:
+            # A backend that cannot describe itself is treated as the least
+            # capable one, which is the same thing every rung already handles.
+            run.caps = Capabilities()
+        run.backend = _describe(store)
+
+    def _retrieve(self, run: _Run) -> None:
+        settings = self._settings
+        store = run.store
+        assert store is not None and run.query_vector is not None
+
+        # Filter by language only when the index actually holds more than one.
+        # Filtering on the sole indexed value cannot change the result set, and
+        # on a filtered ANN search it can actively hurt: pgvector discards
+        # non-matching rows *while* walking the HNSW graph, so a predicate that
+        # excludes nothing still costs candidates. A cross-lingual question
+        # filters by nothing: the whole point is that the passage it wants is
+        # in another language.
+        languages = indexed_languages()
+        language = run.verdict.language if len(languages) > 1 and not run.english else None
+
+        def search() -> list[Hit]:
+            dense = store.search(
+                run.query_vector,
+                strategies=settings.search_strategies,
+                limit=settings.search_limit,
+                language=language,
+            )
+            # Gate 2's floor and margin were swept on cosine over a
+            # cosine-ordered list, and fusion below reorders by rank. Keeping
+            # the dense ranking separately is what lets the gate keep reading
+            # the quantity it was calibrated against while the answer is drawn
+            # from the better-ordered fused list. Without this the margin test
+            # compares the fusion winner against a *higher*-scoring neighbour
+            # and goes negative, abstaining on good retrieval.
+            run.remember_dense(dense)
+
+            if not effort.uses_hybrid(run.level):
+                return dense
+
+            if not run.caps.lexical:
+                # A hosted index is nearest-neighbour and nothing else. Rung 2
+                # still runs — it just runs dense-only, and says so rather than
+                # reporting a hybrid retrieval it did not perform.
+                run.escalate("dense-only")
+                return dense
+
+            lexical = self._lexical(run, store, language)
+            if not lexical:
+                return dense
+
+            run.escalate("hybrid")
+            # Dense first, so the `Hit` that survives fusion carries a cosine:
+            # Gate 2's floor and margin were swept on that scale and an RRF
+            # score would abstain on everything (see src/rag/fuse.py).
+            return fuse.rrf(
+                [dense, lexical],
+                k=settings.rrf_k,
+                limit=max(settings.search_limit, settings.rerank_candidates),
+            )
+
+        def unavailable(error: BaseException) -> list[Hit]:
+            raise Abstain("My sources are unavailable right now.") from error
+
+        # `search` fills `run.dense` as a side effect: Gate 2 has to read a
+        # list that is still ordered by cosine, and the fused list is not one.
+        run.hits = (
+            run.harness.stage(
                 "search",
                 search,
                 # Loopback or in-process: one cheap retry is affordable, and a
@@ -121,169 +317,639 @@ class AskService:
                 backoff_ms=20,
                 retry_on=(StoreUnavailable,),
                 fallback=unavailable,
-            ) or []
-
-            retrieval = guardrails.gate_retrieval(hits, settings)
-            confidence = retrieval.confidence
-            ctx.trace.append(
-                {
-                    "gate": "retrieval",
-                    "top": round(retrieval.top_score, 4),
-                    "margin": round(retrieval.margin, 4),
-                    "ok": retrieval.ok,
-                }
             )
-            if not retrieval.ok:
-                raise Abstain(
-                    retrieval.reason or "I don't have that in my sources.",
-                    confidence=retrieval.confidence,
-                )
-
-            extraction = harness.stage(
-                "extract",
-                lambda: extract_span(
-                    query=verdict.query,
-                    query_vector=query_vector,
-                    hits=hits,
-                    embedder=self._embedder,
-                    settings=settings,
-                    # What is left of the 200 ms decides whether the embedding
-                    # rerank runs at all.
-                    budget_ms=ctx.remaining_ms(),
-                ),
-            )
-
-            if extraction is None:
-                raise Abstain(
-                    "I couldn't pull a clear answer out of what I found.",
-                    confidence=retrieval.confidence,
-                )
-
-            citations = self._citations(extraction, hits)
-
-            grounding = harness.stage(
-                "guard_out",
-                lambda: guardrails.gate_grounding(
-                    extraction.answer, extraction.hit.text, citations
-                ),
-            )
-            if grounding:
-                raise Abstain(grounding, confidence=retrieval.confidence)
-
-            return self._respond(
-                harness,
-                status="answered",
-                answer=extraction.answer,
-                citations=citations,
-                confidence=self._confidence(retrieval.confidence, extraction),
-                reason=None,
-                flags=verdict.flags,
-                method=extraction.method,
-            )
-
-        except Refuse as refusal:
-            return self._respond(
-                harness,
-                status="refused",
-                answer=None,
-                citations=[],
-                confidence=0.0,
-                reason=refusal.reason,
-                flags=verdict.flags if verdict else [],
-                tier=0,
-            )
-        except Abstain as abstention:
-            return self._respond(
-                harness,
-                status="abstained",
-                answer=None,
-                # The near misses: what was found and rejected. `status` already
-                # says nothing was answered, and seeing them is what makes an
-                # abstention inspectable rather than a shrug.
-                citations=self._citations(None, hits),
-                confidence=abstention.confidence or confidence,
-                reason=abstention.reason,
-                flags=verdict.flags if verdict else [],
-            )
-        except Exception as error:  # degradation matrix: never 500 at the user
-            ctx.trace.append({"unhandled": f"{type(error).__name__}: {error}"})
-            return self._respond(
-                harness,
-                status="refused",
-                answer=None,
-                citations=[],
-                confidence=0.0,
-                reason="Something went wrong on my side — try that again.",
-                flags=verdict.flags if verdict else [],
-                tier=0,
-            )
-
-    # ---- helpers --------------------------------------------------------
-
-    def _confidence(self, retrieval_confidence: float, extraction: Extraction) -> float:
-        span = max(1e-6, 1.0 - self._settings.retrieval_floor)
-        span_term = min(
-            1.0, max(0.0, (extraction.score - self._settings.retrieval_floor) / span)
+            or []
         )
-        return round(min(1.0, 0.6 * retrieval_confidence + 0.4 * span_term), 3)
 
-    def _citations(self, extraction: Extraction | None, hits: list[Hit]) -> list[Citation]:
+    def _lexical(self, run: _Run, store: VectorBackend, language: str | None) -> list[Hit]:
+        """The keyword half of the hybrid, or nothing.
+
+        A failure here is never fatal. The channel is an *addition* to dense
+        retrieval — a connected Postgres built by an older migration has no
+        `tsv` column and this raises, and the right answer is a dense-only
+        result rather than no result at all.
+        """
+        search_lexical = getattr(store, "search_lexical", None)
+        if not callable(search_lexical):
+            run.escalate("dense-only")
+            return []
+
+        try:
+            return search_lexical(
+                run.query,
+                strategies=self._settings.search_strategies,
+                limit=self._settings.lexical_limit,
+                language=language,
+            )
+        except Exception as error:
+            run.ctx.trace.append({"lexical": f"{type(error).__name__}: {error}"})
+            run.escalate("dense-only")
+            return []
+
+    def _gate_retrieval(self, run: _Run) -> None:
+        """Gate 2, and the one place the corrective rung can intervene."""
+        verdict = self._score_retrieval(run)
+
+        if not verdict.ok and effort.uses_grading(run.level) and run.repairs_left:
+            # Corrective RAG: the query, not the corpus, may be the problem.
+            # This only runs on retrieval that has *already* been graded bad,
+            # so a rewrite is paid for by a query that was going to be
+            # abstained on anyway — which is what keeps query rewriting off the
+            # happy path where it would be a round trip in front of everything.
+            if self._repair(run):
+                verdict = self._score_retrieval(run)
+
+        run.confidence = verdict.confidence
+        if not verdict.ok:
+            raise Abstain(
+                verdict.reason or "I don't have that in my sources.",
+                confidence=verdict.confidence,
+            )
+
+    def _score_retrieval(self, run: _Run) -> guardrails.RetrievalVerdict:
+        settings = self._settings
+        floor = settings.retrieval_floor_cross_lingual if run.english else None
+        margin = settings.retrieval_margin_cross_lingual if run.english else None
+
+        verdict = guardrails.gate_retrieval(run.dense, settings, floor=floor, margin_floor=margin)
+        run.ctx.trace.append(
+            {
+                "gate": "retrieval",
+                "top": round(verdict.top_score, 4),
+                "margin": round(verdict.margin, 4),
+                "floor": floor if floor is not None else settings.retrieval_floor,
+                "marginFloor": margin if margin is not None else settings.retrieval_margin,
+                "crossLingual": run.english,
+                "ok": verdict.ok,
+            }
+        )
+        return verdict
+
+    def _repair(self, run: _Run) -> bool:
+        """Rewrite the query and retrieve once more. Returns whether it ran.
+
+        Counted against `max_repairs`, and the counter spans *every* repair on
+        the request — a rewrite here and a regeneration later share one budget.
+        Per-branch counters are how a self-correction loop ends up unbounded
+        while every individual branch looks capped.
+        """
+        rewritten = run.harness.stage(
+            "rewrite",
+            lambda: agents.rewrite_query(query=run.query, settings=self._settings),
+            optional=True,
+        )
+        if not rewritten:
+            return False
+
+        run.spend_repair()
+        run.escalate("rewrite")
+        run.ctx.trace.append({"rewrite": rewritten})
+
+        previous = run.hits
+        run.rewritten = rewritten
+        self._embed(run)
+        self._retrieve(run)
+        # Keep what round one found. The rewrite is a second opinion about the
+        # search key, not a verdict that the first retrieval was worthless, and
+        # fusing the two rounds is strictly better than replacing one with the
+        # other when the rewrite drifts off-topic.
+        run.hits = fuse.dedupe([*run.hits, *previous])
+        return True
+
+    def _rerank(self, run: _Run) -> None:
+        assert run.query_vector is not None
+        result = run.harness.stage(
+            "rerank",
+            lambda: rerank(
+                query_vector=run.query_vector,
+                hits=run.hits,
+                embedder=self._embedder,
+                settings=self._settings,
+                budget_ms=run.ctx.remaining_ms(),
+                english=run.english,
+            ),
+            optional=True,
+        )
+        if result is None:
+            return
+
+        ranked, method = result
+        run.ctx.trace.append({"rerank": method, "kept": len(ranked)})
+        if ranked and method == "embedding":
+            run.escalate("rerank")
+            run.hits = ranked
+
+    def _grade_retrieval(self, run: _Run) -> None:
+        """Corrective RAG's relevance grader, over the retrieval as a whole.
+
+        The trigger is aggregate, not per-document. Firing the expensive path
+        because one result in ten was weak fires it on nearly every query — a
+        top-10 almost always contains a weak result, and that is what a top-10
+        is for.
+        """
+        grade = run.harness.stage(
+            "grade",
+            lambda: agents.grade_relevance(
+                query=run.query,
+                hits=run.hits,
+                settings=self._settings,
+                english=run.english,
+            ),
+            optional=True,
+        )
+        if grade is None:
+            # No grader, so the deterministic gate stands on its own — which is
+            # exactly what rungs 0-2 run on. Falling back to "everything is
+            # relevant" would be the same behaviour; falling back loudly is not.
+            run.ctx.trace.append({"grade": "unavailable"})
+            return
+
+        run.ctx.trace.append({"grade": grade.verdict, "kept": len(grade.keep)})
+
+        thin = len(grade.keep) < self._settings.grader_relevant_min
+        if (grade.verdict == "incorrect" or thin) and run.repairs_left:
+            if self._repair(run):
+                return  # the fresh retrieval stands ungraded; one grade per request
+
+        if grade.keep:
+            kept = [hit for hit in run.hits if hit.chunk_id in set(grade.keep)]
+            if kept:
+                run.escalate("graded")
+                run.hits = kept
+
+    # ---- answering -------------------------------------------------------
+
+    def _answer(self, run: _Run) -> AskResponse:
+        if run.level == effort.LOOKUP:
+            return self._answer_lookup(run)
+        if run.level == effort.GROUNDED:
+            return self._answer_extractive(run)
+        return self._answer_synthesised(run)
+
+    def _answer_lookup(self, run: _Run) -> AskResponse:
+        """Rung 0: the passages, as they are. No model, no span selection.
+
+        The whole rung. Gate 2 has already decided that something in the index
+        is close enough to be worth showing, so the top passage is the answer
+        and the rest are the citations. There is nothing to hallucinate because
+        nothing was written — which is also why Gate 3 is skipped rather than
+        run: it checks that an answer is a substring of its source, and here
+        the answer *is* the source.
+        """
+        top = run.hits[0]
+        citations = self._citations(None, run)
+        return self._respond(
+            run,
+            status="answered",
+            answer=top.rendering(english=run.english)[: self._settings.extract_max_chars],
+            citations=citations,
+            confidence=run.confidence,
+            reason=None,
+            method="passage",
+            tier=effort.LOOKUP,
+        )
+
+    def _answer_extractive(self, run: _Run) -> AskResponse:
+        """Rung 1: a span lifted verbatim, checked by construction (Gate 3)."""
+        extraction = run.harness.stage(
+            "extract",
+            lambda: extract_span(
+                query=run.query,
+                query_vector=run.query_vector,
+                hits=run.hits,
+                embedder=self._embedder,
+                settings=self._settings,
+                # What is left of the budget decides whether the embedding
+                # rerank inside extraction runs at all.
+                budget_ms=run.ctx.remaining_ms(),
+                english=run.english,
+            ),
+        )
+
+        if extraction is None:
+            raise Abstain(
+                "I couldn't pull a clear answer out of what I found.",
+                confidence=run.confidence,
+            )
+
+        citations = self._citations(extraction, run)
+        grounding = run.harness.stage(
+            "guard_out",
+            # Against the rendering the span was actually cut from, not the
+            # indexed text — checking an English span against a Devanagari
+            # passage would fail every time and abstain on a good answer.
+            lambda: guardrails.gate_grounding(extraction.answer, extraction.source, citations),
+        )
+        if grounding:
+            raise Abstain(grounding, confidence=run.confidence)
+
+        return self._respond(
+            run,
+            status="answered",
+            answer=extraction.answer,
+            citations=citations,
+            confidence=self._confidence(run, extraction.score),
+            reason=None,
+            method=extraction.method,
+            tier=effort.GROUNDED,
+        )
+
+    def _answer_synthesised(self, run: _Run) -> AskResponse:
+        """Rungs 2-4: one grounded synthesis, checked by Gate 4.
+
+        Two failures are distinguished here because they need different
+        repairs, which is the good idea in adaptive RAG and the one most
+        implementations collapse:
+
+            not supported  → the context was fine, the writing was not
+                             → regenerate from the same context
+            not useful     → the writing was fine, the context was not
+                             → rewrite the query and retrieve again
+
+        Below rung 4 neither repair runs and the answer falls back to the
+        extractive rung, which is a real answer rather than a failure.
+        """
+        for attempt in range(2):
+            answer = run.harness.stage(
+                "generate",
+                lambda: agents.synthesise(
+                    query=run.query,
+                    hits=run.hits,
+                    settings=self._settings,
+                    english=run.english,
+                ),
+            )
+
+            if answer is None:
+                # Either no model is configured or the model said the context
+                # does not answer the question. The first is a degradation and
+                # the second is a correct abstention — and rung 1 can tell them
+                # apart by simply trying, at no network cost.
+                run.ctx.trace.append({"synthesis": "unavailable-or-refused", "attempt": attempt})
+                return self._fallback_extractive(run)
+
+            citations = self._citations(None, run)
+            contexts = [h.rendering(english=run.english) for h in run.hits[:MAX_CITATIONS]]
+
+            # Bound as defaults rather than closed over. The harness calls this
+            # within the same iteration, so late binding is harmless today —
+            # but a stage that ever deferred would silently gate the wrong
+            # attempt's answer, and that failure would be invisible.
+            reason = run.harness.stage(
+                "guard_out",
+                lambda written=answer, ctx=contexts, cited=citations: (
+                    guardrails.gate_generation(
+                        written,
+                        ctx,
+                        cited,
+                        embedder=self._embedder,
+                        settings=self._settings,
+                    )
+                ),
+            )
+
+            verdict = self._grade_answer(run, answer)
+            supported = reason is None and (verdict is None or verdict.supported)
+            useful = verdict is None or verdict.useful
+
+            if supported and useful:
+                run.escalate("synthesis")
+                return self._respond(
+                    run,
+                    status="answered",
+                    answer=answer,
+                    citations=citations,
+                    confidence=self._confidence(run, run.hits[0].score),
+                    reason=None,
+                    method="synthesis",
+                    tier=run.level,
+                )
+
+            run.ctx.trace.append(
+                {"gate": "generation", "supported": supported, "useful": useful, "why": reason}
+            )
+
+            if not run.repairs_left or attempt:
+                break
+
+            if not useful and supported:
+                # Grounded but off-target: the context is the problem.
+                if self._repair(run):
+                    continue
+                break
+
+            # Ungrounded: same context, one more attempt at writing from it.
+            run.spend_repair()
+            run.escalate("regenerate")
+
+        return self._fallback_extractive(run)
+
+    def _grade_answer(self, run: _Run, answer: str) -> agents.Verdict | None:
+        """The usefulness half of Gate 4, and only where it can be acted on.
+
+        Rungs 2 and 3 have no repair for "grounded but off-target" — rung 3
+        spends its repair budget on retrieval — so asking would cost a round
+        trip to learn something nothing downstream can use.
+        """
+        if run.level < effort.ADAPTIVE:
+            return None
+        return run.harness.stage(
+            "grade",
+            lambda: agents.grade_answer(
+                query=run.query,
+                answer=answer,
+                hits=run.hits,
+                settings=self._settings,
+                english=run.english,
+            ),
+            optional=True,
+        )
+
+    def _fallback_extractive(self, run: _Run) -> AskResponse:
+        """Synthesis did not produce a usable answer. Drop to the rung below.
+
+        A rung that cannot do its own job should return the best answer the
+        system *can* produce, not nothing. The response says `tier: 1` while
+        `mode` still says what was asked for, so the degradation is visible in
+        the metrics rather than showing up as a mysteriously good latency.
+        """
+        run.escalate("fallback-extractive")
+        return self._answer_extractive(run)
+
+    # ---- the cache -------------------------------------------------------
+
+    def _scope(self, run: _Run, user_id: str | None) -> Scope:
+        return Scope(
+            user=user_id or "anonymous",
+            backend=run.backend or "default",
+            mode=effort.name(run.level),
+            language=run.ctx.language or "unknown",
+            english=run.english,
+        )
+
+    def _from_cache(self, run: _Run, user_id: str | None) -> AskResponse | None:
+        """Rung 1 and up. Rung 0 is already cheaper than a cache round trip.
+
+        The backend has not been resolved yet at this point, and it is part of
+        the scope, so it is resolved here — the same call the pipeline would
+        make a moment later, and cached per user by the resolver either way.
+        """
+        if run.level < effort.GROUNDED or not self._cache.configured:
+            return None
+
+        self._resolve_backend(run, user_id)
+        scope = self._scope(run, user_id)
+
+        hit = run.harness.stage(
+            "cache",
+            lambda: self._cache.get(run.query, run.query_vector, scope),
+            optional=True,
+        )
+        if hit is None:
+            return None
+
+        payload = hit.payload
+        run.ctx.trace.append({"cache": hit.how, "similarity": hit.similarity})
+        run.escalate(f"cache-{hit.how}")
+
+        return self._respond(
+            run,
+            status="answered",
+            answer=payload.get("answer"),
+            citations=[Citation(**c) for c in payload.get("citations", [])],
+            confidence=float(payload.get("confidence") or 0.0),
+            reason=None,
+            method="cache",
+            tier=int(payload.get("tier") or run.level),
+            cached=True,
+        )
+
+    def _to_cache(self, run: _Run, user_id: str | None, response: AskResponse) -> None:
+        """Only successes, and only what a future request could reuse.
+
+        An abstention is a statement about the corpus at one moment — cache it
+        and a re-ingest that fills the gap stays invisible for a day. A refusal
+        is a statement about the input and costs microseconds to recompute.
+        """
+        if response.status != "answered" or run.level < effort.GROUNDED:
+            return
+        if not self._cache.configured or run.query_vector is None:
+            return
+        if "fallback-extractive" in response.escalations:
+            # A rung that fell back produced the best answer available *at that
+            # moment*, not the answer this rung gives. Caching it under the
+            # rung's own key means a missing model key for one minute serves
+            # degraded answers for the whole TTL, and the metrics show a
+            # healthy cache hit rate the entire time.
+            run.ctx.trace.append({"cache": "skipped", "why": "degraded"})
+            return
+
+        self._cache.put(
+            run.query,
+            run.query_vector,
+            self._scope(run, user_id),
+            {
+                "answer": response.answer,
+                "citations": [c.model_dump() for c in response.citations],
+                "confidence": response.confidence,
+                "tier": response.tier,
+                "method": response.method,
+            },
+        )
+
+    # ---- helpers ---------------------------------------------------------
+
+    def _corpus_hint(self) -> str:
+        """One line about what is actually indexed, for the router to route on.
+
+        Built from the ingest manifest rather than hardcoded, because a vague
+        description is a routing bug: told only "a passage index", the router
+        decides a perfectly ordinary factual question is something a search
+        could not help with and skips retrieval entirely. The chunk count and
+        the languages are what make "would this be in there?" answerable.
+        """
+        manifest = read_manifest() or {}
+        languages = ", ".join(manifest.get("languages") or indexed_languages()) or "unknown"
+        chunks = manifest.get("chunks")
+        size = f"{chunks:,} passages" if isinstance(chunks, int) else "a passage index"
+        return (
+            f"{size} of general-knowledge web text — encyclopedic and how-to "
+            f"articles covering facts, definitions, places, organisations, "
+            f"health, science and everyday questions. Languages: {languages}."
+        )
+
+    def _confidence(self, run: _Run, span_score: float) -> float:
+        floor = (
+            self._settings.retrieval_floor_cross_lingual
+            if run.english
+            else self._settings.retrieval_floor
+        )
+        span = max(1e-6, 1.0 - floor)
+        span_term = min(1.0, max(0.0, (span_score - floor) / span))
+        return round(min(1.0, 0.6 * run.confidence + 0.4 * span_term), 3)
+
+    def _citations(self, extraction: Extraction | None, run: _Run) -> list[Citation]:
         ordered: list[Hit] = []
         if extraction is not None:
             ordered.append(extraction.hit)
-        ordered.extend(h for h in hits if extraction is None or h.chunk_id != extraction.hit.chunk_id)
-
-        return [self._citation(hit) for hit in ordered[:MAX_CITATIONS]]
+        ordered.extend(
+            h for h in run.hits if extraction is None or h.chunk_id != extraction.hit.chunk_id
+        )
+        return [self._citation(hit, run.english) for hit in ordered[:MAX_CITATIONS]]
 
     @staticmethod
-    def _citation(hit: Hit) -> Citation:
+    def _citation(hit: Hit, english: bool = False) -> Citation:
         origins = hit.payload.get("origins") or []
         return Citation(
             doc_id=hit.chunk_id,
             strategy=hit.strategy,
             score=round(hit.score, 4),
-            text=hit.text,
+            # The rendering that was answered from, so a citation can be read
+            # by whoever is reading the answer.
+            text=hit.rendering(english=english),
             source_query_ids=list(hit.payload.get("sourceQueryIds") or []),
             is_gold=any(origin.get("isSelected") for origin in origins),
         )
 
     def _respond(
         self,
-        harness: Harness,
+        run: _Run,
         *,
         status: str,
         answer: str | None,
         citations: list[Citation],
         confidence: float,
         reason: str | None,
-        flags: list[str],
         method: str | None = None,
-        tier: int = TIER,
+        tier: int | None = None,
+        cached: bool = False,
     ) -> AskResponse:
-        ctx = harness.ctx
-        timings = Timings(**harness.finish())
+        ctx = run.ctx
+        timings = Timings(**run.harness.finish())
+        budget = self._settings.deadline_for(run.level)
         response = AskResponse(
             status=status,  # type: ignore[arg-type]
             answer=answer,
             citations=citations,
             confidence=confidence,
-            tier=tier,
+            tier=run.level if tier is None else tier,
             reason=reason,
             timings=timings,
             request_id=ctx.request_id,
             language=ctx.language,
-            flags=flags,
+            flags=run.flags,
             method=method,
-            within_budget=timings.total <= self._settings.deadline_ms,
+            mode=effort.name(run.level),
+            cached=cached,
+            backend=run.backend,
+            escalations=run.escalations,
+            budget_ms=budget,
+            within_budget=timings.total <= budget,
         )
         self._metrics.record(response, ctx.trace)
         return response
+
+
+# ---- per-request state ---------------------------------------------------
+
+
+class _Run:
+    """Everything one request accumulates as it climbs the ladder.
+
+    A mutable bag rather than threaded arguments, because the stages genuinely
+    share state — a rewrite replaces the query *and* the vector *and* the hits,
+    and passing eleven values through six methods to avoid saying so would hide
+    that rather than prevent it.
+    """
+
+    __slots__ = (
+        "request", "level", "ctx", "harness", "settings", "store", "caps", "verdict",
+        "query_vector", "english", "hits", "dense", "confidence", "escalations",
+        "backend", "rewritten", "direct", "_repairs",
+    )
+
+    def __init__(
+        self,
+        *,
+        request: AskRequest,
+        level: int,
+        ctx: Ctx,
+        harness: Harness,
+        settings: Settings,
+    ) -> None:
+        self.request = request
+        self.level = level
+        self.ctx = ctx
+        self.harness = harness
+        self.settings = settings
+        self.store: VectorBackend | None = None
+        self.caps = Capabilities()
+        self.verdict: guardrails.InputVerdict | None = None
+        self.query_vector: np.ndarray | None = None
+        self.english = False
+        self.hits: list[Hit] = []
+        #: The same results in cosine order, across every retrieval round. Only
+        #: Gate 2 reads it — see `remember_dense`.
+        self.dense: list[Hit] = []
+        self.confidence = 0.0
+        self.escalations: list[str] = []
+        self.backend: str | None = None
+        self.rewritten: str | None = None
+        self.direct = False
+        self._repairs = 0
+
+    @property
+    def query(self) -> str:
+        """What to search with: the rewrite if there was one, else Gate 1's text."""
+        if self.rewritten:
+            return self.rewritten
+        return self.verdict.query if self.verdict else self.request.transcript
+
+    @property
+    def flags(self) -> list[str]:
+        flags = list(self.verdict.flags) if self.verdict else []
+        if self.direct:
+            # Read by the voice loop: this was not a corpus question, so answer
+            # it conversationally instead of reading out an abstention.
+            flags.append("direct")
+        return flags
+
+    @property
+    def repairs_left(self) -> bool:
+        return self._repairs < self.settings.max_repairs
+
+    def spend_repair(self) -> None:
+        self._repairs += 1
+
+    def escalate(self, what: str) -> None:
+        if what not in self.escalations:
+            self.escalations.append(what)
+
+    def remember_dense(self, hits: list[Hit]) -> None:
+        """Merge a round of dense results into the cosine-ordered view.
+
+        Rounds accumulate rather than replace, because after a corrective
+        rewrite the question Gate 2 has to answer is "did *either* attempt find
+        something", not "did the most recent one". A rewrite that drifts
+        off-topic would otherwise turn a passable first retrieval into an
+        abstention.
+        """
+        merged = {hit.chunk_id: hit for hit in [*self.dense, *hits]}
+        self.dense = sorted(merged.values(), key=lambda h: h.score, reverse=True)
+
+
+def _describe(store: VectorBackend) -> str:
+    try:
+        return store.describe()
+    except Exception:
+        return getattr(store, "name", "unknown")
 
 
 def get_ask_service() -> AskService:
     return AskService(
         get_settings(),
         get_embedder(),
-        get_store(),
+        get_resolver(),
         get_metrics_service(),
+        get_cache(),
     )

@@ -25,6 +25,8 @@ import textwrap
 from scripts.ingest import DEFAULT_CACHE, HF_URL, read_rows
 from src.core.config import get_settings
 from src.rag.embed import get_embedder
+from src.rag.backends.resolve import FixedResolver
+from src.rag.cache import AnswerCache
 from src.rag.store import get_store
 from src.schemas.ask import AskRequest, AskResponse
 from src.services.ask_service import AskService
@@ -87,7 +89,15 @@ def main() -> None:
     embedder = get_embedder()
     store = get_store()
     embedder.warm()
-    service = AskService(settings, embedder, store, MetricsService(settings))
+    # Same reason as the evaluation sweep: a demo that answers the second
+    # question from a cache is demonstrating Redis, not retrieval.
+    service = AskService(
+        settings,
+        embedder,
+        FixedResolver(store),
+        MetricsService(settings),
+        AnswerCache(settings.model_copy(update={"cache_enabled": False})),
+    )
 
     def ask(transcript: str) -> AskResponse:
         return service.ask(

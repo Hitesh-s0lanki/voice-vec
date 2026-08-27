@@ -41,6 +41,9 @@ class Extraction:
     method: str
     sentences: int
     hit: Hit
+    #: What the answer was cut out of. Gate 3 verifies the span against this,
+    #: and the citation quotes it, so both stay in the language answered in.
+    source: str
 
 
 @dataclass(slots=True)
@@ -49,6 +52,9 @@ class _Window:
     text: str
     lexical: float
     sentences: int
+    #: The rendering the window was cut from — Gate 3 checks the span against
+    #: this exact string, so it has to travel with it rather than be rebuilt.
+    source: str
 
 
 def _lexical_score(query_tokens: set[str], sentence: str) -> float:
@@ -65,22 +71,32 @@ def _lexical_score(query_tokens: set[str], sentence: str) -> float:
     return overlap / (len(query_tokens) ** 0.5 * (1 + len(sentence_tokens) ** 0.25))
 
 
-def _windows(hit: Hit, spans: list[Sentence], query_tokens: set[str], settings: Settings) -> list[_Window]:
+def _windows(
+    hit: Hit,
+    source: str,
+    spans: list[Sentence],
+    query_tokens: set[str],
+    settings: Settings,
+) -> list[_Window]:
     """Single sentences, plus a two-sentence variant for the strongest one.
 
     Slicing the parent text by offsets keeps the window verbatim, which is what
-    lets Gate 3 be a substring check.
+    lets Gate 3 be a substring check. `source` is that parent — the indexed
+    text, or the English original it was translated from — and every offset
+    here indexes into it.
     """
     out: list[_Window] = []
 
     for index, span in enumerate(spans):
         lexical = _lexical_score(query_tokens, span.text)
-        out.append(_Window(hit, span.text[: settings.extract_max_chars], lexical, 1))
+        out.append(
+            _Window(hit, span.text[: settings.extract_max_chars], lexical, 1, source)
+        )
 
         if settings.extract_max_sentences > 1 and index + 1 < len(spans):
-            joined = hit.text[span.start : spans[index + 1].end]
+            joined = source[span.start : spans[index + 1].end]
             out.append(
-                _Window(hit, joined[: settings.extract_max_chars], lexical, 2)
+                _Window(hit, joined[: settings.extract_max_chars], lexical, 2, source)
             )
 
     return out
@@ -94,8 +110,17 @@ def extract_span(
     embedder: Embedder,
     settings: Settings,
     budget_ms: float,
+    english: bool = False,
 ) -> Extraction | None:
-    """Pick the best answer span across the top retrieved chunks."""
+    """Pick the best answer span across the top retrieved chunks.
+
+    `english` answers from the original MS MARCO passage rather than the
+    indexed translation. That is what a cross-lingual question needs: retrieval
+    found the right passage through e5's shared space, but the span read back
+    has to be in a language the asker speaks — and it also makes the lexical
+    prefilter below work at all, since an English query shares no tokens with
+    Devanagari.
+    """
     if not hits:
         return None
 
@@ -103,9 +128,10 @@ def extract_span(
     candidates: list[_Window] = []
 
     for hit in hits[: settings.extract_passages]:
-        spans = split_sentences(hit.text)
+        source = hit.rendering(english=english)
+        spans = split_sentences(source)
         if spans:
-            candidates.extend(_windows(hit, spans, query_tokens, settings))
+            candidates.extend(_windows(hit, source, spans, query_tokens, settings))
 
     if not candidates:
         return None
@@ -126,6 +152,7 @@ def extract_span(
             method="lexical",
             sentences=best.sentences,
             hit=best.hit,
+            source=best.source,
         )
 
     vectors = embedder.embed_passages([w.text for w in shortlist], batch_size=len(shortlist))
@@ -141,4 +168,5 @@ def extract_span(
         method="embedding",
         sentences=best.sentences,
         hit=best.hit,
+        source=best.source,
     )
