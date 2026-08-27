@@ -1,3 +1,5 @@
+import { ClerkProvider } from "@clerk/nextjs";
+import { shadcn } from "@clerk/ui/themes";
 import type { Metadata, Viewport } from "next";
 import { Fraunces, Manrope, Noto_Sans_Devanagari } from "next/font/google";
 import "./globals.css";
@@ -57,18 +59,20 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       className={`${manrope.variable} ${fraunces.variable} ${devanagari.variable} h-full antialiased`}
     >
       <body className="flex min-h-full flex-col">
-        <ConversationProvider>
-          <TooltipProvider delayDuration={150}>
-            <AppHeader />
-            <AppSidebar />
-            {children}
-            {/* pb bumps up under ~770px, where the centered line would
-                otherwise run under the bottom-right rail. */}
-            <footer className="pointer-events-none fixed inset-x-0 bottom-0 z-30 px-6 py-5 text-center text-[0.72rem] tracking-wide text-ink-muted max-md:pb-24">
-              Sarvam Saaras hears · Bulbul answers · 30 seconds per take
-            </footer>
-          </TooltipProvider>
-        </ConversationProvider>
+        <ClerkProvider appearance={{ theme: shadcn }}>
+          <ConversationProvider>
+            <TooltipProvider delayDuration={150}>
+              <AppHeader />
+              <AppSidebar />
+              {children}
+              {/* pb bumps up under ~770px, where the centered line would
+                  otherwise run under the bottom-right rail. */}
+              <footer className="pointer-events-none fixed inset-x-0 bottom-0 z-30 px-6 py-5 text-center text-[0.72rem] tracking-wide text-ink-muted max-md:pb-24">
+                Sarvam Saaras hears · Bulbul answers · 30 seconds per take
+              </footer>
+            </TooltipProvider>
+          </ConversationProvider>
+        </ClerkProvider>
       </body>
     </html>
   );

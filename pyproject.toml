@@ -18,6 +18,10 @@ dependencies = [
     # an opaque blob and `<=>` fails to resolve.
     "pgvector>=0.3.6",
     "psycopg[binary,pool]>=3.2.3",
+    # Clerk session tokens are RS256 JWTs, and the browser talks to this
+    # server directly over the voice socket — so this is what proves a
+    # `?token=` actually came from Clerk (src/core/clerk.py).
+    "pyjwt[crypto]>=2.10.1",
     "uvicorn[standard]>=0.52.3",
 ]
 

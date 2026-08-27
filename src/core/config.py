@@ -89,6 +89,21 @@ class Settings(BaseSettings):
     # `VoiceService._retrieve`. Everything downstream of it already exists.
     rag_enabled: bool = False
 
+    # ---- Clerk (src/core/clerk.py) --------------------------------------
+    # Who a caller is, when they are signed in. The browser opens the voice
+    # socket against this server directly, so identity arrives as a Clerk
+    # session token and is verified here — an id in a header or a query
+    # parameter is something anyone can type.
+    #
+    # The publishable key is enough: the instance host is base64'd into it and
+    # the signing keys are fetched from there once an hour. CLERK_JWT_KEY is
+    # the PEM from the dashboard, for a deployment that would rather not make
+    # an outbound call at handshake time; set either, or neither, in which case
+    # every caller is anonymous and conversations belong to the browser.
+    clerk_publishable_key: str = ""
+    clerk_jwt_key: str = ""
+    clerk_jwks_ttl_s: int = 3600
+
     # ---- Embedding ------------------------------------------------------
     # multilingual-e5-small: 384 dims, ONNX, ~3 ms per query on CPU. The ONNX
     # export lives in the same HF repo as the torch weights (`onnx/model.onnx`).
