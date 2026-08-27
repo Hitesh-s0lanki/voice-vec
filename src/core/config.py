@@ -219,6 +219,27 @@ class Settings(BaseSettings):
     # Which chunking strategies to query. v1 ingests S1 only (see docs/03-chunking.md).
     search_strategies: list[str] = ["S1"]
 
+    # ---- The effort ladder (docs/15-effort.md) ---------------------------
+    # One rung per RAG architecture, and the level the caller asks for is a
+    # *ceiling* rather than a floor: a question the cache answers costs nothing
+    # even at rung 4. `AskResponse.tier` reports which rung actually answered.
+    #
+    #   0 lookup      search only, no LLM anywhere on the path
+    #   1 grounded    + extractive span + the semantic answer cache
+    #   2 deep        + hybrid, rerank, LLM synthesis over the retrieved set
+    #   3 corrective  + relevance grading, query rewrite, one re-retrieval
+    #   4 adaptive    + routing before retrieval, capped repair loop
+    effort_max: int = 4
+    effort_default: int = 1
+
+    # Each rung gets its own budget. Requirement 3's 200 ms is a claim about
+    # rungs 0–1, which are the ones with no network call after the transcript;
+    # a rung that makes LLM calls cannot meet it and says so rather than being
+    # measured against a deadline it was never going to hold. The harness skips
+    # optional stages against *this* number, so a shared 200 ms would make rung
+    # 3 skip the grading it exists to do.
+    effort_deadline_ms: list[int] = [200, 200, 2500, 9000, 16000]
+
     # ---- Guardrails (docs/06-guardrails.md) -----------------------------
     # Gate 2, swept against the labelled abstention set by `scripts/evaluate.py`
     # over N=300 and set to the balanced operating point (docs/09-v1.md):
@@ -290,6 +311,24 @@ class Settings(BaseSettings):
     keepalive_seconds: int = 20
 
     # ---- Resolved providers ---------------------------------------------
+
+    def effort_level(self, requested: int | None) -> int:
+        """The rung this request may climb to, clamped to what exists."""
+        if requested is None:
+            requested = self.effort_default
+        return max(0, min(int(requested), self.effort_max))
+
+    def deadline_for(self, effort: int) -> int:
+        """The budget that rung is measured against.
+
+        Falls back to `deadline_ms` for a rung with no entry, so adding a rung
+        without extending the list degrades to the strict budget rather than to
+        an unbounded one.
+        """
+        table = self.effort_deadline_ms
+        if 0 <= effort < len(table):
+            return int(table[effort])
+        return self.deadline_ms
 
     @property
     def sarvam_ready(self) -> bool:

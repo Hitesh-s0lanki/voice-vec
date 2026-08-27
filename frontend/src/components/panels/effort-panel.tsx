@@ -1,60 +1,65 @@
 "use client";
 
-import { useCallback } from "react";
-
 import { PanelHeading, PanelRule } from "@/components/panels/panel";
-import { Slider } from "@/components/ui/slider";
 import { EFFORT_LEVELS, useEffort } from "@/lib/effort";
 import { cn } from "@/lib/utils";
 
 /**
- * How hard the agent should think before it answers. The levels themselves and
- * the persisted state live in `@/lib/effort`, because the capture flow reads
- * the same value when it decides whether to run retrieval.
+ * How the question gets answered. Five rungs, each a different retrieval
+ * architecture — the levels and the persisted state live in `@/lib/effort`,
+ * because the voice session reads the same value when it starts a take.
+ *
+ * A vertical list rather than a slider with labels underneath, for a reason
+ * that is measurable rather than aesthetic: five labels laid across a `w-72`
+ * panel need 291px of a 272px content box, so the last one ("Adaptive") was
+ * clipped mid-word. Stacking them also buys each rung a real one-line
+ * description, which a tick label can never carry — and the ordering the
+ * slider was there to express is just as visible top-to-bottom.
  */
 export function EffortPanel() {
   const [effort, setEffort] = useEffort();
 
-  const onValueChange = useCallback(
-    ([next]: number[]) => setEffort(next),
-    [setEffort],
-  );
-
-  const level = EFFORT_LEVELS[effort];
-
   return (
     <>
-      <PanelHeading title="Effort" hint={level.hint} />
+      <PanelHeading title="Effort" hint="How the question gets answered." />
 
       <PanelRule />
 
-      <div className="flex flex-col gap-3 px-2 pt-1 pb-1">
-        <Slider
-          aria-label="Agent effort"
-          min={0}
-          max={EFFORT_LEVELS.length - 1}
-          step={1}
-          value={[effort]}
-          onValueChange={onValueChange}
-        />
+      <div role="radiogroup" aria-label="Agent effort" className="flex flex-col gap-0.5">
+        {EFFORT_LEVELS.map(({ label, hint, detail, cost }, index) => (
+          <button
+            key={label}
+            type="button"
+            role="radio"
+            aria-checked={index === effort}
+            title={detail}
+            onClick={() => setEffort(index)}
+            // `data-active` is the hook `.glass-row` watches for a held
+            // selection — see the note above it in globals.css.
+            data-active={index === effort}
+            className="glass-row flex flex-col gap-0.5 rounded-lg px-2 py-1.5 text-left"
+          >
+            <span className="flex items-baseline justify-between gap-2">
+              <span
+                className={cn(
+                  "text-[0.78rem] tracking-[-0.01em]",
+                  index === effort ? "font-medium text-ink" : "text-ink-soft",
+                )}
+              >
+                {label}
+              </span>
+              <span className="shrink-0 text-[0.66rem] tabular-nums tracking-wide text-ink-muted">
+                {cost}
+              </span>
+            </span>
 
-        <div className="flex justify-between">
-          {EFFORT_LEVELS.map(({ label }, index) => (
-            <button
-              key={label}
-              type="button"
-              onClick={() => setEffort(index)}
-              className={cn(
-                "rounded-md px-1 py-0.5 text-[0.68rem] tracking-wide transition-colors",
-                index === effort
-                  ? "font-medium text-ink"
-                  : "text-ink-muted hover:text-ink-soft",
-              )}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
+            {/* One line, always. The strings in `@/lib/effort` are written to
+                that budget; truncating is the backstop, not the plan. */}
+            <span className="truncate text-[0.7rem] leading-snug text-ink-muted">
+              {hint}
+            </span>
+          </button>
+        ))}
       </div>
     </>
   );
