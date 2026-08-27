@@ -24,6 +24,11 @@ dependencies = [
     "pyjwt[crypto]>=2.10.1",
     "uvicorn[standard]>=0.52.3",
     "composio>=0.20.0",
+    # The answer cache (src/rag/cache.py). Optional at runtime — no REDIS_URL
+    # means no cache and every question runs the full path — but the client is
+    # a hard dependency so that a deployment which *does* set the URL cannot
+    # silently get exact-match caching because an extra was never installed.
+    "redis>=5.2.0",
 ]
 
 [dependency-groups]

@@ -15,6 +15,7 @@ from src.api.router import api_router
 from src.chat.store import ChatStore, get_chat_store
 from src.core.config import Settings, get_settings
 from src.core.db import get_db
+from src.rag.cache import get_cache
 from src.rag.embed import Embedder, get_embedder
 from src.rag.store import VectorStore, get_store
 from src.voice.http import close_client
@@ -103,6 +104,20 @@ async def lifespan(app: FastAPI):
                 log.info("keepalive every %ds", settings.keepalive_seconds)
         except Exception as error:  # index not built yet — /health says so, /ask abstains
             log.warning("index unavailable (%s) — run scripts/ingest.py", error)
+
+        # Open the answer cache here rather than on the first question. Two
+        # reasons, and the second is the one that matters: connecting costs a
+        # round trip and a possible index creation, which would land inside
+        # somebody's first answer; and until it has connected, the cache cannot
+        # say whether it got the semantic layout or fell back to exact-only —
+        # so `/voice/config` would report "not connected yet" to a client that
+        # asked precisely so it could tell the user.
+        cache = get_cache()
+        if cache.configured:
+            await anyio.to_thread.run_sync(cache.warm)
+            log.info("answer cache %s", cache.describe())
+        else:
+            log.info("answer cache off (REDIS_URL unset) — every question runs the full path")
     else:
         log.info("retrieval disabled (RAG_ENABLED=false) — /ask abstains, voice answers directly")
 
@@ -113,10 +128,13 @@ async def lifespan(app: FastAPI):
         with suppress(asyncio.CancelledError):
             await warm_loop
 
+    get_cache().close()
+
     await close_client()
 
-    if store is not None:
-        store.close()
+    # The pool is shared, and conversations can have opened it with retrieval
+    # off, so closing it is not the vector store's business any more.
+    get_db().close()
 
 
 def create_app() -> FastAPI:
