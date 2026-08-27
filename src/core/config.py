@@ -124,11 +124,62 @@ class Settings(BaseSettings):
     # one value in this file that is worth as much as the database.
     composio_encryption_key: str = ""
 
+    # Where Composio sends the browser back once consent is given or refused.
+    # It is the *frontend* origin, not this server's — the page that reports
+    # the outcome is a Next route, and Composio appends its own query string
+    # to whatever is handed over.
+    frontend_url: str = "http://localhost:3002"
+    composio_callback_path: str = "/integration"
+
+    # How long a user's toolkit catalogue is held before it is asked for again.
+    # It changes about as often as Composio ships an integration, and the panel
+    # that renders it opens on a click. Cached per user, because it is fetched
+    # with that user's key.
+    composio_catalog_ttl_s: int = 900
+    composio_timeout_s: float = 15.0
+    # How many users' SDK clients to keep built at once. Small: a client is
+    # cheap to rebuild and this is a rail panel, not the voice path.
+    composio_client_cache: int = 64
+
     # How many users' vector backends to keep built. Smaller than the Composio
     # cache because these are more expensive to hold: a connected pgvector
     # backend keeps a connection pool open against somebody else's database,
     # and evicting one hands those connections back.
     vector_backend_cache: int = 16
+
+    # ---- Tool calling (src/integrations/agent.py) ------------------------
+    # A spoken turn can run the tools a user has linked through Composio. The
+    # whole feature is skipped for anybody who has linked nothing, so these
+    # only bite once somebody has.
+    #
+    # False turns it off everywhere without disconnecting anyone.
+    tools_enabled: bool = True
+    # How long tool schemas are held. Keyed by the set of linked toolkits too,
+    # so linking one shows up on the next turn rather than after this elapses.
+    tool_schema_ttl_s: int = 300
+    # Schemas ride in every prompt of the turn, so the cap is a token budget as
+    # much as a latency one.
+    tool_schema_limit: int = 40
+    # How many decide-run-decide rounds before the model has to answer. Two is
+    # enough for "search, then send"; more is usually a loop.
+    tool_max_rounds: int = 2
+    # A tool that has not answered by here is costing the listener more than it
+    # is worth. The turn continues and says so.
+    tool_timeout_s: float = 20.0
+
+    @property
+    def composio_ready(self) -> bool:
+        """Whether *anyone* can connect Composio on this deployment.
+
+        Not "is Composio configured" — there is no server-side Composio account
+        any more. This asks only whether there is somewhere safe to put a user's
+        key once they hand one over.
+        """
+        return bool(self.composio_encryption_key)
+
+    @property
+    def composio_callback_url(self) -> str:
+        return f"{self.frontend_url.rstrip('/')}{self.composio_callback_path}"
 
     # ---- Embedding ------------------------------------------------------
     # multilingual-e5-small: 384 dims, ONNX, ~3 ms per query on CPU. The ONNX

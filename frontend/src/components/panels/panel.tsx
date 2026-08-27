@@ -54,12 +54,16 @@ export function PanelRule({ className }: { className?: string }) {
 export function PanelChip({
   children,
   className,
+  title,
 }: {
   children: ReactNode;
   className?: string;
+  /** Native tooltip, for a chip whose meaning is not obvious from its text. */
+  title?: string;
 }) {
   return (
     <span
+      title={title}
       className={cn(
         "rounded-full border border-line px-2 py-0.5 text-[0.66rem] font-medium tracking-wide text-ink-muted",
         className,

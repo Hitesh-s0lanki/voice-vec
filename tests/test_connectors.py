@@ -114,6 +114,153 @@ class TestHint:
         assert len(hint("wxyz")) == 4
 
 
+class FakeStore:
+    """Just the lookup, holding sealed rows the way Postgres would."""
+
+    def __init__(self, rows: dict) -> None:
+        self._rows = rows
+        self.configured = True
+
+    def get(self, user_id, connector):
+        return self._rows.get(user_id)
+
+    def list(self, user_id):
+        row = self._rows.get(user_id)
+        return [row] if row else []
+
+
+class TestClientIsolation:
+    """One Composio per user, and no way to get one without naming a user.
+
+    This is the property the whole rewrite exists for. The old shape had a
+    process-wide client built from a server key; if a caller can obtain a
+    client without a user id, or can be handed one built from somebody else's
+    key, every other guarantee in this module is decoration.
+    """
+
+    KEY = TestSealing.KEY
+
+    def _clients(self, rows):
+        from src.connectors.service import ConnectorService
+        from src.integrations.client import ComposioClients
+
+        sealed = Sealed(FakeSettings(self.KEY))
+        settings = SimpleNamespace(
+            composio_timeout_s=15.0,
+            composio_client_cache=8,
+            composio_callback_url="http://localhost:3002/integration",
+        )
+        store = FakeStore(rows)
+        clients = ComposioClients(ConnectorService(store, sealed), store, settings)
+        # Don't build a real SDK — record which key it would have been built
+        # from. That string is exactly what must never cross users.
+        clients.build = lambda api_key: SimpleNamespace(built_from=api_key)
+        return clients, sealed
+
+    def _row(self, sealed, key):
+        return SimpleNamespace(
+            connector="composio",
+            credentials=sealed.seal_map({"api_key": key}),
+            hints={"api_key_hint": key[-4:]},
+        )
+
+    def test_each_user_gets_a_client_built_from_their_own_key(self):
+        clients, sealed = self._clients({})
+        rows = {
+            "user_a": self._row(sealed, "ak_aaaa_aaaaaaaa"),
+            "user_b": self._row(sealed, "ak_bbbb_bbbbbbbb"),
+        }
+        clients._store = FakeStore(rows)
+        clients._connectors._store = clients._store
+
+        assert clients.for_user("user_a").built_from == "ak_aaaa_aaaaaaaa"
+        assert clients.for_user("user_b").built_from == "ak_bbbb_bbbbbbbb"
+
+    def test_a_cached_client_is_not_served_to_another_user(self):
+        clients, sealed = self._clients({})
+        clients._store = FakeStore(
+            {
+                "user_a": self._row(sealed, "ak_aaaa_aaaaaaaa"),
+                "user_b": self._row(sealed, "ak_bbbb_bbbbbbbb"),
+            }
+        )
+        clients._connectors._store = clients._store
+
+        first = clients.for_user("user_a")
+        assert clients.for_user("user_b") is not first
+        assert clients.for_user("user_a") is first  # still cached, still theirs
+
+    def test_changing_a_key_invalidates_the_cached_client(self):
+        """A rotated key must stop being used immediately.
+
+        Otherwise this app keeps acting on a credential its owner revoked, for
+        as long as the process lives.
+        """
+        rows = {"user_a": None}
+        clients, sealed = self._clients(rows)
+        store = FakeStore(rows)
+        clients._store = store
+
+        rows["user_a"] = self._row(sealed, "ak_old_oldoldold")
+        assert clients.for_user("user_a").built_from == "ak_old_oldoldold"
+
+        rows["user_a"] = self._row(sealed, "ak_new_newnewnew")
+        assert clients.for_user("user_a").built_from == "ak_new_newnewnew"
+
+    def test_a_user_with_no_row_gets_not_connected(self):
+        from src.integrations.client import NotConnected
+
+        clients, _ = self._clients({})
+        with pytest.raises(NotConnected):
+            clients.for_user("user_nobody")
+
+    def test_no_user_id_gets_not_connected_rather_than_anything(self):
+        """There is no ambient credential to fall back to, and no default."""
+        from src.integrations.client import NotConnected
+
+        clients, sealed = self._clients({})
+        clients._store = FakeStore({"user_a": self._row(sealed, "ak_aaaa_aaaaaaaa")})
+        clients._connectors._store = clients._store
+
+        for missing in ("", None):
+            with pytest.raises(NotConnected):
+                clients.for_user(missing)
+
+    def test_a_row_sealed_under_a_rotated_master_key_is_not_connected(self):
+        """Unreadable and absent are the same thing to a caller: reconnect."""
+        from src.integrations.client import NotConnected
+
+        clients, _ = self._clients({})
+        stranger = Sealed(FakeSettings(TestSealing.OTHER))
+        clients._store = FakeStore({"user_a": self._row(stranger, "ak_aaaa_aaaaaaaa")})
+        clients._connectors._store = clients._store
+
+        with pytest.raises(NotConnected, match="reconnect"):
+            clients.for_user("user_a")
+
+    def test_forget_drops_the_cached_client(self):
+        clients, sealed = self._clients({})
+        clients._store = FakeStore({"user_a": self._row(sealed, "ak_aaaa_aaaaaaaa")})
+        clients._connectors._store = clients._store
+
+        first = clients.for_user("user_a")
+        clients.forget("user_a")
+        assert clients.for_user("user_a") is not first
+
+    def test_the_cache_is_bounded(self):
+        """A client per user who ever signed in is a slow leak of live keys."""
+        clients, sealed = self._clients({})
+        clients._store = FakeStore(
+            {f"user_{n}": self._row(sealed, f"ak_{n:04d}_padding") for n in range(20)}
+        )
+        clients._connectors._store = clients._store
+
+        for n in range(20):
+            clients.for_user(f"user_{n}")
+
+        assert len(clients._cache) <= 8
+
+
 class TestRegistry:
     """The four connectors, and the promises the panel renders them on."""
 
