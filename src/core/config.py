@@ -240,6 +240,112 @@ class Settings(BaseSettings):
     # 3 skip the grading it exists to do.
     effort_deadline_ms: list[int] = [200, 200, 2500, 9000, 16000]
 
+    # ---- Hybrid + rerank (rung 2 and up) ---------------------------------
+    # The lexical channel only runs on a backend that has one — pgvector does
+    # (`tsv` and its GIN index are built at ingest), a hosted Pinecone or Astra
+    # index does not. `VectorBackend.capabilities()` is what decides, so a
+    # connected store degrades to dense-only instead of erroring.
+    lexical_limit: int = 20
+    # Reciprocal rank fusion's damping. 60 is the value from the original TREC
+    # write-up and the one every implementation since has used; it matters
+    # little as long as it is well above the list lengths being fused.
+    rrf_k: int = 60
+    # How many fused candidates the passage rerank scores, and how many survive.
+    rerank_candidates: int = 20
+    rerank_keep: int = 5
+    # MMR's relevance/diversity trade. 1.0 is a plain rerank with no diversity
+    # term at all, which is the escape hatch if diversity ever measures worse
+    # than it reads — the five chunking strategies overlap by construction, so
+    # it should not, but that is a claim to check rather than assume.
+    mmr_lambda: float = 0.7
+
+    # ---- Synthesis and graders (rung 2 and up) ---------------------------
+    # These are the network calls the ladder buys with latency. Separate from
+    # `llm_*` above, which is the *voice* model: this one answers in text, is
+    # not streamed, and wants a much colder temperature than a conversation.
+    synthesis_max_tokens: int = 320
+    synthesis_temperature: float = 0.1
+    synthesis_context_passages: int = 5
+    ask_llm_timeout_s: float = 20.0
+    grader_timeout_s: float = 10.0
+    grader_max_tokens: int = 200
+
+    # Gate 4. A generated answer cannot be checked by substring the way an
+    # extracted span can, so every sentence of it is embedded and scored
+    # against the sentences of the context it was given. Below this, the answer
+    # is not supported by what was retrieved and the pipeline abstains.
+    # Local — the embedder is already loaded — so the gate costs milliseconds,
+    # not a round trip. Sweep it with scripts/evaluate.py after any re-ingest.
+    generation_support_floor: float = 0.62
+    # How many of the answer's sentences may fall below that floor and still
+    # pass. One unsupported clause in a four-sentence answer is a hedge; half
+    # of them is a hallucination.
+    generation_support_ratio: float = 0.7
+
+    # ---- Repairs (rungs 3 and 4) -----------------------------------------
+    # Every self-correction loop ships with a counter. The reference
+    # implementation this ladder is drawn from wires `generate → generate` with
+    # no cap and only fails to spin because a different bug crashes it first
+    # (docs/agentic-rag/07-findings.md).
+    max_repairs: int = 1
+    # Corrective RAG's trigger. The paper grades confidence over the *whole*
+    # retrieval; grading one document at a time and firing on any single
+    # failure runs the expensive path on nearly every query.
+    grader_relevant_min: int = 2
+
+    # ---- Answer cache (Redis) --------------------------------------------
+    # Cache-augmented generation, rung 1 and up. A repeat question is answered
+    # from Redis at embedding cost alone — no search, no synthesis.
+    #
+    #   REDIS_URL=redis://127.0.0.1:6379/0        local
+    #   REDIS_URL=rediss://default:pw@host:6379   managed, TLS
+    #
+    # Unset, the cache is simply off and every question runs the full path.
+    # Nothing else changes, which is what makes this safe to leave empty.
+    redis_url: str = ""
+    cache_enabled: bool = True
+    cache_prefix: str = "vec:cache"
+    cache_ttl_s: int = 86_400
+    # Redis sits on the answer path, so it gets a budget rather than a default
+    # socket timeout: a cache that has not answered in 150 ms has already cost
+    # more than the search it was meant to save. Measured against a managed
+    # instance one region away, a warm round trip is ~6 ms.
+    cache_timeout_s: float = 0.15
+    # *Opening* the connection is a different budget, and collapsing the two is
+    # a bug that only appears against a remote Redis: a TLS handshake across a
+    # region measured ~93 ms and can easily exceed the per-operation ceiling
+    # above, in which case the cache silently never connects at all.
+    cache_connect_timeout_s: float = 3.0
+    # The semantic half needs RediSearch (Redis Stack, or Redis 8's bundled
+    # query engine). Plain Redis keeps the exact-match half and says so once in
+    # the log — an honest downgrade rather than a silent one.
+    cache_semantic: bool = True
+    # How close a past question has to be to answer this one. Cosine over
+    # L2-normalised e5 vectors, so it is on the same scale as everything else
+    # here — unlike the raw squared-L2 threshold in the notebook this idea came
+    # from, which does not transfer between embedding models.
+    #
+    # Deliberately high. A loose cache threshold is a correctness bug that
+    # presents as a performance win: it answers a question nobody asked, and
+    # the answer looks perfectly reasonable. Sweep it before lowering it.
+    cache_similarity: float = 0.97
+    # How many cached answers to keep per scope before the oldest are dropped.
+    # Measured against a managed Redis 8 with `MEMORY USAGE`: one entry with a
+    # realistic Devanagari payload costs 6.09 KB, so a 30 MB instance holds
+    # roughly five thousand before index overhead.
+    #
+    # Lowered from 1_500 when agent memory moved into the same instance
+    # (docs/16-memory.md). Redis Cloud's Agent Memory service attaches to a
+    # database rather than provisioning one, so on the free tier the cache and
+    # the agent's memory share these 30 MB — and the database's `volatile-lru`
+    # cannot tell them apart, which means an unbounded cache does not simply
+    # fill up, it evicts the agent's memories. 900 entries is ~5.5 MB per
+    # scope. Raise it with the instance, not with the hit rate.
+    cache_max_entries: int = 900
+    # A single payload larger than this is not cached at all. Guards against one
+    # pathological passage taking a measurable share of a small instance.
+    cache_max_entry_bytes: int = 16_384
+
     # ---- Guardrails (docs/06-guardrails.md) -----------------------------
     # Gate 2, swept against the labelled abstention set by `scripts/evaluate.py`
     # over N=300 and set to the balanced operating point (docs/09-v1.md):
@@ -311,6 +417,10 @@ class Settings(BaseSettings):
     keepalive_seconds: int = 20
 
     # ---- Resolved providers ---------------------------------------------
+
+    @property
+    def redis_ready(self) -> bool:
+        return bool(self.redis_url) and self.cache_enabled
 
     def effort_level(self, requested: int | None) -> int:
         """The rung this request may climb to, clamped to what exists."""
