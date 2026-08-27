@@ -191,8 +191,20 @@ def main() -> None:
     # and nothing queries the index until ingest is done.
     print("\nbuilding indexes (hnsw, gin)")
     index_started = time.perf_counter()
-    store.create_indexes()
-    print(f"  built in {time.perf_counter() - index_started:.1f}s")
+    indexed = True
+    try:
+        store.create_indexes()
+        print(f"  built in {time.perf_counter() - index_started:.1f}s")
+    except Exception as error:
+        # The rows are in and the manifest below describes them, so losing this
+        # step must not lose the record of a six-minute embedding run — that is
+        # how you end up with a populated table and a manifest still describing
+        # the *previous* index. Searches work meanwhile; they fall back to a
+        # sequential scan, which is slow and exact rather than fast and
+        # approximate. `scripts.migrate --indexes` finishes the job.
+        indexed = False
+        print(f"  FAILED after {time.perf_counter() - index_started:.1f}s: {error}")
+        print("  rows are in — finish with: uv run python -m scripts.migrate --indexes")
 
     elapsed = time.perf_counter() - started
     total = store.count()
@@ -219,6 +231,11 @@ def main() -> None:
             "answerable_rows": sum(1 for row in rows if row.answerable),
             "unanswerable_rows": sum(1 for row in rows if not row.answerable),
             "at_token_cap": at_cap,
+            # False means every search is a sequential scan until
+            # `scripts.migrate --indexes` runs. Recorded rather than assumed,
+            # because a table that answers correctly but slowly looks healthy
+            # from every other angle.
+            "indexed": indexed,
         },
     ).write()
 
