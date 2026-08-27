@@ -346,6 +346,55 @@ class Settings(BaseSettings):
     # pathological passage taking a measurable share of a small instance.
     cache_max_entry_bytes: int = 16_384
 
+    # ---- Agent memory (docs/16-memory.md) --------------------------------
+    # Redis Agent Memory — the managed service, not a library. Turns are
+    # mirrored into session memory as they happen; the service extracts durable
+    # facts from them in the background and this deployment searches those
+    # facts before the model answers, so a *new* conversation can open knowing
+    # something a previous one established.
+    #
+    # Three values, all from the service's Configuration tab in the Redis Cloud
+    # console. The endpoint must carry its scheme.
+    #
+    #   AGENT_MEMORY_ENDPOINT=https://<service>.agent-memory.redis.io
+    #   AGENT_MEMORY_STORE_ID=<store id>
+    #   AGENT_MEMORY_API_KEY=<service key, shown exactly once at creation>
+    #
+    # Any of them unset and the agent simply keeps no memory across
+    # conversations. Everything else is unchanged, which is what makes this
+    # safe to leave empty — same contract as REDIS_URL above.
+    agent_memory_endpoint: str = ""
+    agent_memory_store_id: str = ""
+    agent_memory_api_key: str = ""
+    agent_memory_enabled: bool = True
+    # Keeps one deployment's memories out of another's when both point at the
+    # same store. Left empty, memories carry no namespace at all — which is the
+    # honest default, because the service's positive namespace filters never
+    # match a record that has none, so a half-set namespace would silently
+    # recall nothing rather than recall too much.
+    agent_memory_namespace: str = ""
+    # Recall sits on the answer path, so it gets a budget rather than a default
+    # timeout — the same reasoning as `cache_timeout_s`, at a larger figure
+    # because this round trip embeds the query and runs a KNN rather than
+    # reading a key. It runs concurrently with retrieval, so this is the amount
+    # of latency it can add, not the amount it costs.
+    agent_memory_timeout_ms: int = 600
+    # How many facts may reach the prompt. Small on purpose: these arrive ahead
+    # of the retrieved context and the question itself, and a paragraph of
+    # half-relevant biography is a distraction the model pays attention to.
+    agent_memory_limit: int = 3
+    # How close a memory has to be to the question to be worth stating. An
+    # unfiltered nearest-neighbour search always returns *something*, and an
+    # irrelevant fact asserted as true about the listener in the first sentence
+    # of a prompt is worse than no memory at all. Looser than the cache's 0.97
+    # because a recalled fact informs an answer rather than replacing one.
+    agent_memory_similarity: float = 0.62
+    # Every mirrored event is trimmed to this before it is sent. The instance
+    # is the reason, not the request: an untrimmed monologue costs its full
+    # length in a 30 MB database for as long as its session lives, and adds
+    # nothing to extraction past the first couple of thousand characters.
+    agent_memory_max_chars: int = 2_000
+
     # ---- Guardrails (docs/06-guardrails.md) -----------------------------
     # Gate 2, swept against the labelled abstention set by `scripts/evaluate.py`
     # over N=300 and set to the balanced operating point (docs/09-v1.md):
@@ -421,6 +470,15 @@ class Settings(BaseSettings):
     @property
     def redis_ready(self) -> bool:
         return bool(self.redis_url) and self.cache_enabled
+
+    @property
+    def agent_memory_ready(self) -> bool:
+        return bool(
+            self.agent_memory_enabled
+            and self.agent_memory_endpoint
+            and self.agent_memory_store_id
+            and self.agent_memory_api_key
+        )
 
     def effort_level(self, requested: int | None) -> int:
         """The rung this request may climb to, clamped to what exists."""

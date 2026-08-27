@@ -124,7 +124,11 @@ Voice:
 _LANGUAGE_UNKNOWN = "the same language the user spoke"
 
 
-def system_prompt(language_code: str | None, context: str | None = None) -> str:
+def system_prompt(
+    language_code: str | None,
+    context: str | None = None,
+    memories: str | None = None,
+) -> str:
     """The instruction the model opens with, aimed at the detected language."""
     name = display(language_code)
     # A code we have no name for — a language outside Sarvam's list — is worse
@@ -133,6 +137,26 @@ def system_prompt(language_code: str | None, context: str | None = None) -> str:
     language = name if name and language_code in LANGUAGES else _LANGUAGE_UNKNOWN
 
     prompt = _SYSTEM.format(language=language)
+
+    if memories:
+        # Facts Redis Agent Memory extracted from earlier conversations with
+        # this same listener (src/memory/store.py) — the only part of this
+        # prompt that outlives a conversation.
+        #
+        # Three sentences of framing for what is usually one line of content,
+        # because the failure mode is specific and expensive out loud: a model
+        # handed bare facts recites them ("Since you're vegetarian…") when
+        # nobody asked, which is how an assistant that remembers stops sounding
+        # like one that listens. They are also *stale by construction* —
+        # extracted from a conversation that has since ended — so the live
+        # transcript has to be told, explicitly, that it wins.
+        prompt += (
+            "\nWhat you already know about this person, from earlier conversations:\n"
+            f"{memories}\n"
+            "Use this only when it changes the answer. Never recite it, never mention "
+            "remembering, and never bring it up unprompted. If what they say now "
+            "contradicts it, they are right and it is out of date.\n"
+        )
 
     if context:
         # Only reachable with RAG_ENABLED=true. Retrieval is off in this build.
@@ -151,6 +175,7 @@ def build_messages(
     history: list[Message],
     language_code: str | None,
     context: str | None = None,
+    memories: str | None = None,
     max_turns: int = 8,
 ) -> list[Message]:
     """System prompt, the recent past, then what was just said.
@@ -161,7 +186,7 @@ def build_messages(
     """
     recent = history[-(max_turns * 2) :] if max_turns > 0 else []
     return [
-        {"role": "system", "content": system_prompt(language_code, context)},
+        {"role": "system", "content": system_prompt(language_code, context, memories)},
         *recent,
         {"role": "user", "content": transcript},
     ]

@@ -1282,6 +1282,20 @@ wheels = [
 ]
 
 [[package]]
+name = "redis-agent-memory"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpcore" },
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f8/51/6a77bc5452bfde246d4fac2dc4ffb40697431888236ef07cc8dab35005f3/redis_agent_memory-0.3.0.tar.gz", hash = "sha256:7a70d1145db70f0d30d20d0245e8273521e34a527c7126ecd41f3026917245c3", size = 64458, upload-time = "2026-08-24T13:09:34.056Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/89/86/8230c358e9da53af4831ef7e4c2fed0ebd4b4413a7e7733eb7fb922f565c/redis_agent_memory-0.3.0-py3-none-any.whl", hash = "sha256:a72f98add561a34fdf61c8ec1e95d3104a83e523e9e4f3b5e5a6f248f9046443", size = 119053, upload-time = "2026-08-24T13:09:33.094Z" },
+]
+
+[[package]]
 name = "referencing"
 version = "0.37.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1563,6 +1577,7 @@ dependencies = [
     { name = "pyjwt", extra = ["crypto"] },
     { name = "python-multipart" },
     { name = "redis" },
+    { name = "redis-agent-memory" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -1584,6 +1599,7 @@ requires-dist = [
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10.1" },
     { name = "python-multipart", specifier = ">=0.0.20" },
     { name = "redis", specifier = ">=5.2.0" },
+    { name = "redis-agent-memory", specifier = ">=0.3.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.52.3" },
 ]
 

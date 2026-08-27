@@ -24,6 +24,12 @@ dependencies = [
     "pyjwt[crypto]>=2.10.1",
     "uvicorn[standard]>=0.52.3",
     "composio>=0.20.0",
+    # Agent memory (src/memory/store.py). Optional at runtime in exactly the
+    # way the cache is — no AGENT_MEMORY_ENDPOINT means the agent keeps only
+    # the history on the socket — but a hard dependency so a deployment that
+    # *does* configure the service cannot silently get nothing because an
+    # extra was never installed. Speakeasy-generated, httpx + pydantic only.
+    "redis-agent-memory>=0.3.0",
     # The answer cache (src/rag/cache.py). Optional at runtime — no REDIS_URL
     # means no cache and every question runs the full path — but the client is
     # a hard dependency so that a deployment which *does* set the URL cannot
