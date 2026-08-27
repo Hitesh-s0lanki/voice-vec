@@ -16,8 +16,11 @@ from __future__ import annotations
 import argparse
 import time
 
+from src.chat.store import CONVERSATIONS, MESSAGES, get_chat_store
+from src.chat.tools import TOOL_CALLS, get_tool_call_store
 from src.core.config import get_settings
 from src.connectors.store import ACCOUNTS, get_connector_store
+from src.integrations.store import AUTH_CONFIGS, CONNECTIONS, get_integration_store
 from src.rag.store import StoreUnavailable, get_store
 
 
@@ -72,6 +75,19 @@ def main() -> None:
     store.ensure_schema(settings.embed_dim, recreate=args.recreate)
     print(f"schema ready: {store.table} (vector({settings.embed_dim}))")
 
+    # Conversations live in the same database and are needed whether or not
+    # retrieval is on, so they are created here too. `--recreate` does not
+    # touch them: dropping the chunk table is a re-ingest, and taking every
+    # saved conversation with it would be a surprise nobody asked for.
+    get_chat_store().ensure_schema()
+    print(f"schema ready: {CONVERSATIONS}, {MESSAGES}")
+
+    # What the agent ran, beside the conversation that caused it. A tool call
+    # is the one thing a spoken turn does that has an effect outside this app,
+    # so it gets its own audit trail (src/chat/tools.py).
+    get_tool_call_store().ensure_schema()
+    print(f"schema ready: {TOOL_CALLS}")
+
     # Connectors — the outside services a user attaches to their account, with
     # their credentials encrypted. Same reasoning again: needed whether or not
     # retrieval is on, and in fact one of them *is* retrieval, since a
@@ -79,6 +95,11 @@ def main() -> None:
     # (docs/13-connectors.md).
     get_connector_store().ensure_schema()
     print(f"schema ready: {ACCOUNTS}")
+
+    # The toolkits connected through somebody's Composio. Composio-specific,
+    # so it lives apart from the generic credential table above.
+    get_integration_store().ensure_schema()
+    print(f"schema ready: {AUTH_CONFIGS}, {CONNECTIONS}")
 
     if args.english:
         # The migration for an index built before the English column existed.
