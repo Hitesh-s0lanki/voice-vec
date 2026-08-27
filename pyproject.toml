@@ -13,7 +13,11 @@ dependencies = [
     "pydantic-settings>=2.15.0",
     # FastAPI needs this to read the multipart upload on /voice/transcribe.
     "python-multipart>=0.0.20",
-    "qdrant-client>=1.19.0",
+    # Postgres + pgvector is the store (src/rag/store.py). `pgvector`
+    # registers the vector type adapter; without it a numpy array binds as
+    # an opaque blob and `<=>` fails to resolve.
+    "pgvector>=0.3.6",
+    "psycopg[binary,pool]>=3.2.3",
     "uvicorn[standard]>=0.52.3",
 ]
 

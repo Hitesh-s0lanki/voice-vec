@@ -94,10 +94,10 @@ class AskService:
 
             # Filter by language only when the index actually holds more than
             # one. Filtering on the sole indexed value cannot change the result
-            # set, and embedded Qdrant evaluates payload filters by scanning
-            # every point in Python — measured at 92 ms of a 200 ms budget over
-            # 19,870 chunks. A Qdrant server indexes the field and would not
-            # care; the single-language skip is correct in both modes.
+            # set, and on a filtered ANN search it can actively hurt: pgvector
+            # discards non-matching rows *while* walking the HNSW graph, so a
+            # predicate that excludes nothing still costs candidates. Cheap to
+            # keep, so it stays for the day a second language is indexed.
             languages = indexed_languages()
             filter_language = verdict.language if len(languages) > 1 else None
 

@@ -12,7 +12,7 @@ than assumed: each candidate is run through the live pipeline and kept only if
 it comes back `answered`, because a suggestion that abstains is worse than no
 suggestion at all.
 
-Talks to the running API over HTTP on purpose — embedded Qdrant is single-writer,
+Talks to the running API over HTTP on purpose — it reuses the warm embedder,
 so this cannot open the store while the service holds it.
 """
 

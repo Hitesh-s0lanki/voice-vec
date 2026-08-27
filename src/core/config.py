@@ -99,14 +99,28 @@ class Settings(BaseSettings):
     embed_threads: int | None = None
     embed_cache_dir: str = "data/models"
 
-    # ---- Vector store ---------------------------------------------------
-    # Empty URL means embedded mode: Qdrant runs in-process over `qdrant_path`.
-    # That path is a single-writer lock — ingest and the API cannot hold it at
-    # the same time. Point QDRANT_URL at a server to run both together.
-    qdrant_url: str = ""
-    qdrant_api_key: str = ""
-    qdrant_path: str = "data/qdrant"
-    qdrant_collection: str = "vec-chunks"
+    # ---- Vector store (Postgres + pgvector) -----------------------------
+    # Neon, or any Postgres with the `vector` extension available. Use the
+    # *pooled* endpoint (the host carrying `-pooler`) — the store disables
+    # prepared statements for it, and a direct endpoint exhausts its connection
+    # limit under the API's pool.
+    #
+    # Region matters to the SLO, not just to comfort: search measured ~11 ms
+    # in-process, and every millisecond of round trip is spent inside the same
+    # 200 ms as extraction's 78 ms (docs/04-latency.md). Keep the database in
+    # the region the API runs in.
+    database_url: str = ""
+    pg_table: str = "chunks"
+    pg_pool_min: int = 1
+    pg_pool_max: int = 8
+    pg_connect_timeout_s: float = 10.0
+    # A query that outlives the 200 ms deadline is already lost; the ceiling is
+    # generous because ingest shares the pool and legitimately runs longer.
+    pg_statement_timeout_ms: int = 5000
+    # HNSW search breadth. Below `search_limit` the index cannot return a full
+    # page, so the store raises it to match. Higher trades latency for recall
+    # and is the first dial to turn if recall@5 drops after the migration.
+    hnsw_ef_search: int = 64
 
     # ---- Retrieval ------------------------------------------------------
     search_limit: int = 10
@@ -147,8 +161,9 @@ class Settings(BaseSettings):
     # Warming the embedder once at boot is not enough. Measured on this machine:
     # after 30 s of no traffic the next request pays ~+30 ms on embed and ~+30 ms
     # on search, and a cold *answered* request measured 200.3 ms — over budget.
-    # Back-to-back it is 78 ms. The ONNX arena and Qdrant's vector matrix go cold
-    # when nothing touches them, and interactive voice use is all cold requests:
+    # Back-to-back it is 78 ms. The ONNX arena goes cold when nothing touches it,
+    # and a pooled connection idles out too; interactive voice use is all cold
+    # requests:
     # one question, then minutes of silence.
     #
     # So a tiny embed + search runs on this interval to keep both hot. ~12 ms of
