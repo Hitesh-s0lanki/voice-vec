@@ -17,8 +17,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal
 
+import numpy as np
+
 from src.core.config import Settings
-from src.rag.chunk import normalise
+from src.rag.chunk import normalise, split_sentences
+from src.rag.embed import Embedder
 from src.rag.languages import display_name, to_flores
 from src.rag.store import Hit
 
@@ -55,6 +58,9 @@ class InputVerdict:
     language: str | None
     reason: str | None = None
     flags: list[str] = field(default_factory=list)
+    #: The question is in a language the index does not hold. Not a refusal —
+    #: a routing decision. See the language block in `gate_input`.
+    cross_lingual: bool = False
 
     @property
     def blocked(self) -> bool:
@@ -104,34 +110,41 @@ def gate_input(
         query = normalise(_INJECTION.sub(" ", query))
         flags.append("injection")
 
+    # ---- language: a routing decision, not a refusal ---------------------
+    #
+    # Asking in English against a Hindi index used to abstain here, and that
+    # was the gate contradicting the rest of the design. `multilingual-e5` was
+    # chosen over a monolingual embedder precisely because it puts a question
+    # and its translation in the same region of the same space, and every chunk
+    # carries the original English MS MARCO passage beside the Indic one
+    # (docs/01-dataset.md). Both halves of a cross-lingual answer are already
+    # here; refusing on the strength of a language *label* threw them away.
+    #
+    # So a mismatch turns the language filter off and answers from the English
+    # rendering, and the question of whether retrieval was actually good enough
+    # goes where it belongs — Gate 2, where it is a measured score against a
+    # swept floor rather than a tag comparison.
     language = to_flores(language_code)
+    cross_lingual = bool(
+        language_code and (language is None or (indexed_languages and language not in indexed_languages))
+    )
 
-    if language_code and language is None:
-        return InputVerdict(
-            status="abstained",
-            query=query,
-            language=None,
-            reason=f"I don't have an index for {language_code} yet.",
-            flags=[*flags, "unsupported-language"],
-        )
-
-    if language and indexed_languages and language not in indexed_languages:
-        return InputVerdict(
-            status="abstained",
-            query=query,
-            language=language,
-            reason=(
-                f"I heard {display_name(language)}, but my sources are only indexed in "
-                + ", ".join(display_name(code) for code in indexed_languages)
-                + "."
-            ),
-            flags=[*flags, "unsupported-language"],
-        )
-
-    return InputVerdict(status="answered", query=query, language=language, flags=flags)
+    return InputVerdict(
+        status="answered",
+        query=query,
+        language=language,
+        flags=[*flags, "cross-lingual"] if cross_lingual else flags,
+        cross_lingual=cross_lingual,
+    )
 
 
-def gate_retrieval(hits: list[Hit], settings: Settings) -> RetrievalVerdict:
+def gate_retrieval(
+    hits: list[Hit],
+    settings: Settings,
+    *,
+    floor: float | None = None,
+    margin_floor: float | None = None,
+) -> RetrievalVerdict:
     """Score floor + margin + minimum hit count.
 
     The margin test matters as much as the floor. Ten results all at 0.61 mean
@@ -139,7 +152,18 @@ def gate_retrieval(hits: list[Hit], settings: Settings) -> RetrievalVerdict:
     does. An absolute floor alone cannot tell those apart — and the hard case
     here is exactly that, because an unanswerable query's own passages are in
     the index and are topically adjacent to it.
+
+    Both thresholds can be overridden, and a cross-lingual question overrides
+    both. The query and the passage are in different languages there, and e5
+    puts a translation pair close but not as close as a paraphrase — so the
+    scores compress, and so do the gaps between them. Measured over 200
+    questions asked in both languages: mean top 0.8942 → 0.8469, mean margin
+    0.0239 → 0.0179. Holding that to thresholds swept on Hindi-against-Hindi
+    abstains on retrieval that was in fact right, and the margin is where most
+    of the damage is (coverage 52% → 34% at the same setting).
     """
+    floor = settings.retrieval_floor if floor is None else floor
+    margin_floor = settings.retrieval_margin if margin_floor is None else margin_floor
     if not hits:
         return RetrievalVerdict(
             ok=False,
@@ -151,15 +175,15 @@ def gate_retrieval(hits: list[Hit], settings: Settings) -> RetrievalVerdict:
 
     top = hits[0].score
     rest = [hit.score for hit in hits[1:5]]
-    margin = top - (sum(rest) / len(rest)) if rest else settings.retrieval_margin
-    above_floor = sum(1 for hit in hits if hit.score >= settings.retrieval_floor)
+    margin = top - (sum(rest) / len(rest)) if rest else margin_floor
+    above_floor = sum(1 for hit in hits if hit.score >= floor)
 
-    span = max(1e-6, 1.0 - settings.retrieval_floor)
-    score_term = min(1.0, max(0.0, (top - settings.retrieval_floor) / span))
-    margin_term = min(1.0, max(0.0, margin / max(1e-6, settings.retrieval_margin)))
+    span = max(1e-6, 1.0 - floor)
+    score_term = min(1.0, max(0.0, (top - floor) / span))
+    margin_term = min(1.0, max(0.0, margin / max(1e-6, margin_floor)))
     confidence = round(0.65 * score_term + 0.35 * margin_term, 3)
 
-    if top < settings.retrieval_floor:
+    if top < floor:
         return RetrievalVerdict(
             ok=False,
             confidence=confidence,
@@ -177,7 +201,7 @@ def gate_retrieval(hits: list[Hit], settings: Settings) -> RetrievalVerdict:
             reason="The evidence I found is too thin to answer from.",
         )
 
-    if margin < settings.retrieval_margin:
+    if margin < margin_floor:
         return RetrievalVerdict(
             ok=False,
             confidence=confidence,

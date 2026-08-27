@@ -25,6 +25,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--recreate", action="store_true", help="drop the table first")
     parser.add_argument("--indexes", action="store_true", help="also build the indexes")
+    parser.add_argument(
+        "--english",
+        action="store_true",
+        help="embed the English original of every row missing embedding_en",
+    )
     args = parser.parse_args()
 
     settings = get_settings()
@@ -74,6 +79,42 @@ def main() -> None:
     # (docs/13-connectors.md).
     get_connector_store().ensure_schema()
     print(f"schema ready: {ACCOUNTS}")
+
+    if args.english:
+        # The migration for an index built before the English column existed.
+        # Only the rows that need it, so it is resumable: interrupt it and the
+        # next run picks up exactly where it stopped, because "needs a vector"
+        # is a question the table answers.
+        from src.rag.embed import get_embedder
+
+        embedder = get_embedder()
+        backlog = store.english_backlog()
+        print(f"embedding {len(backlog)} English originals")
+
+        if backlog:
+            embedder.warm()
+            started = time.perf_counter()
+            batch_size = 128
+
+            for offset in range(0, len(backlog), batch_size):
+                batch = backlog[offset : offset + batch_size]
+                vectors = embedder.embed_passages(
+                    [text for _, text in batch], batch_size=len(batch)
+                )
+                store.backfill_english([key for key, _ in batch], vectors)
+
+                done = offset + len(batch)
+                rate = done / (time.perf_counter() - started)
+                print(
+                    f"  {done}/{len(backlog)}  {rate:.0f}/s  "
+                    f"eta {(len(backlog) - done) / rate / 60:.1f} min   ",
+                    end="\r",
+                    flush=True,
+                )
+            print(f"\n  done in {(time.perf_counter() - started) / 60:.1f} min")
+            # The partial HNSW index only covers non-null rows, so it has to be
+            # rebuilt over what just stopped being null.
+            args.indexes = True
 
     if args.indexes:
         started = time.perf_counter()

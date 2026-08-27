@@ -110,20 +110,69 @@ class TestGateInput:
         assert "injection" in verdict.flags
         assert "ignore previous" not in verdict.query.lower()
 
-    def test_unindexed_language_abstains_rather_than_searching(self):
+    def test_an_unindexed_language_routes_rather_than_refusing(self):
+        """The embedder is cross-lingual and every chunk carries its English
+        original — refusing on the language label threw both away."""
         verdict = gate_input("இது என்ன?", "ta-IN", SETTINGS, ["hin_Deva"])
-        assert verdict.status == "abstained"
-        assert "unsupported-language" in verdict.flags
 
-    def test_unknown_language_code_abstains(self):
+        assert verdict.status == "answered"
+        assert verdict.cross_lingual is True
+        assert "cross-lingual" in verdict.flags
+        assert verdict.language == "tam_Taml"
+
+    def test_english_over_a_hindi_index_is_the_ordinary_case(self):
+        verdict = gate_input("what is a corporation", "en-IN", SETTINGS, ["hin_Deva"])
+
+        assert verdict.status == "answered"
+        assert verdict.cross_lingual is True
+
+    def test_an_unmappable_language_code_still_searches(self):
+        """e5 covers far more languages than the dataset is tagged with, and
+        with one language indexed there is no filter to get wrong anyway."""
         verdict = gate_input("what is this", "fr-FR", SETTINGS, ["hin_Deva"])
-        assert verdict.status == "abstained"
+
+        assert verdict.status == "answered"
+        assert verdict.cross_lingual is True
+        assert verdict.language is None
+
+    def test_the_indexed_language_is_not_cross_lingual(self):
+        verdict = gate_input("कॉर्पोरेशन क्या है?", "hi-IN", SETTINGS, ["hin_Deva"])
+
+        assert verdict.cross_lingual is False
+        assert "cross-lingual" not in verdict.flags
 
     def test_missing_language_code_still_answers(self):
-        # Sarvam can return null; that is not a reason to refuse to look.
+        # Sarvam can return null; that is not a reason to refuse to look — nor
+        # to treat it as cross-lingual, since nothing says it is.
         verdict = gate_input("कॉर्पोरेशन क्या है?", None, SETTINGS, ["hin_Deva"])
         assert verdict.status == "answered"
         assert verdict.language is None
+        assert verdict.cross_lingual is False
+
+
+class TestRendering:
+    """Which text an answer is cut out of, when the question is not in the
+    language the index holds."""
+
+    def test_prefers_the_english_original_when_asked_for(self):
+        row = Hit(
+            chunk_id="S1:1",
+            strategy="S1",
+            score=0.8,
+            text="एक निगम एक कंपनी है।",
+            payload={"english": "A corporation is a company."},
+        )
+
+        assert row.rendering(english=True) == "A corporation is a company."
+        assert row.rendering(english=False) == "एक निगम एक कंपनी है।"
+
+    @pytest.mark.parametrize("payload", [{}, {"english": None}, {"english": "   "}])
+    def test_falls_back_to_the_indexed_text(self, payload):
+        """S2–S5 may merge passages with no single English original. A hit
+        must never render as empty — that would abstain on a good retrieval."""
+        row = Hit(chunk_id="S1:1", strategy="S1", score=0.8, text="हिंदी", payload=payload)
+
+        assert row.rendering(english=True) == "हिंदी"
 
 
 class TestGateRetrieval:
@@ -133,6 +182,25 @@ class TestGateRetrieval:
     def test_below_floor_abstains(self):
         floor = SETTINGS.retrieval_floor
         assert gate_retrieval([hit(floor - 0.05)], SETTINGS).ok is False
+
+    def test_a_cross_lingual_floor_lets_a_lower_score_through(self):
+        """Cross-lingual cosines sit lower than same-language ones, so the
+        swept floor would abstain on retrieval that was in fact right."""
+        score = SETTINGS.retrieval_floor - 0.04
+        near_misses = [hit(score), hit(score - 0.1), hit(score - 0.12)]
+
+        assert gate_retrieval(near_misses, SETTINGS).ok is False
+        assert gate_retrieval(
+            near_misses, SETTINGS, floor=SETTINGS.retrieval_floor_cross_lingual
+        ).ok is True
+
+    def test_the_margin_test_survives_a_lower_floor(self):
+        """The floor moves; "nothing stands out" must not become answerable."""
+        flat = [hit(0.80), hit(0.80), hit(0.799)]
+
+        assert gate_retrieval(
+            flat, SETTINGS, floor=SETTINGS.retrieval_floor_cross_lingual
+        ).ok is False
 
     def test_uniform_scores_abstain_on_margin(self):
         # Ten results all equally mediocre: nothing stands out, so nothing is

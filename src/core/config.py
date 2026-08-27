@@ -181,7 +181,33 @@ class Settings(BaseSettings):
     # high, so almost nothing falls below it and the margin does the work. Both
     # are index-size dependent: re-sweep after any re-ingest.
     retrieval_floor: float = 0.845
+    # The same floor, for a question asked in a language the index does not
+    # hold. Cross-lingual cosines sit lower — the query and the passage are in
+    # different languages, and e5 places a translation pair close but not as
+    # close as a paraphrase — so the swept thresholds above abstain on
+    # retrieval that was right. Measured rather than guessed, by
+    # `scripts/crosslingual.py` over 200 questions asked twice, once in each
+    # language (docs/13-cross-lingual.md):
+    #
+    #                top score  margin  recall@5
+    #   hindi           0.8942  0.0239    0.6967
+    #   english         0.8469  0.0179    0.6475
+    #
+    # 0.78 is the highest floor that costs nothing: coverage is flat from 0.70
+    # to 0.78 and falls from 0.80 up, so under it the margin decides — the same
+    # regime the Hindi floor was picked in. Re-measure after any re-ingest.
+    retrieval_floor_cross_lingual: float = 0.78
     retrieval_margin: float = 0.02
+    # The margin matters far more than the floor here, because the gaps
+    # compress along with the scores. Picked to land on the *same operating
+    # point* as Hindi rather than on a new preference — the coverage the margin
+    # above was chosen for, measured on the same index:
+    #
+    #   margin   coverage (hi / en)   abstention recall (hi / en)
+    #   0.010     77.05% / 73.77%          33.33% / 30.77%
+    #   0.015     58.20% / 53.28%          47.44% / 52.56%  ← en matches hi@0.02
+    #   0.020     52.46% / 34.43%          62.82% / 75.64%  ← hi default
+    retrieval_margin_cross_lingual: float = 0.015
     min_hits: int = 1
     min_transcript_chars: int = 3
 

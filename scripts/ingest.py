@@ -105,6 +105,11 @@ def main() -> None:
     parser.add_argument("--strategies", default=ChunkStrategy.PASSAGE.value)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--recreate", action="store_true", help="drop the table first")
+    parser.add_argument(
+        "--no-english",
+        action="store_true",
+        help="skip the English embedding pass (halves the run, loses native English retrieval)",
+    )
     args = parser.parse_args()
 
     source = args.source or (str(DEFAULT_CACHE) if DEFAULT_CACHE.exists() else HF_URL)
@@ -174,7 +179,27 @@ def main() -> None:
     for start in range(0, len(chunks), args.batch_size):
         batch = chunks[start : start + args.batch_size]
         vectors = embedder.embed_passages([c.text for c in batch], batch_size=len(batch))
-        store.upsert(batch, vectors)
+
+        # The same passage, embedded from its English original, into its own
+        # column. It costs a second pass over the corpus and buys native
+        # retrieval for every question asked in English — no cross-lingual hop,
+        # and against the text MS MARCO actually wrote rather than a machine
+        # translation of it (docs/13-cross-lingual.md). Chunks with no English
+        # rendering embed as null and fall back to the Indic vector at query
+        # time.
+        english_vectors = None
+        if not args.no_english:
+            originals = [(c.english or "").strip() for c in batch]
+            if any(originals):
+                english_vectors = embedder.embed_passages(
+                    [text or " " for text in originals], batch_size=len(batch)
+                )
+                english_vectors = [
+                    vector if text else None
+                    for vector, text in zip(english_vectors, originals)
+                ]
+
+        store.upsert(batch, vectors, english_vectors)
 
         done = start + len(batch)
         spent = time.perf_counter() - embedding_started
