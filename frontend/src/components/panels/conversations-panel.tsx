@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { MessagesSquare } from "lucide-react";
+import { Check, MessagesSquare, Wrench, X } from "lucide-react";
 
 import {
   PanelChip,
@@ -11,15 +11,20 @@ import {
 } from "@/components/panels/panel";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useConversation, type Turn } from "@/lib/conversation";
+import type { ToolCall } from "@/lib/conversations";
 import { languageName } from "@/lib/languages";
 import { relativeTime } from "@/lib/time";
 
 /**
  * The threaded read: what was heard, and what came back. Turns run oldest to
  * newest and the view opens pinned to the bottom, the way a chat log reads.
+ *
+ * On `/c/{id}` this is the stored thread, read back out of Postgres — which is
+ * the whole point of the answer never being printed on the stage. It was
+ * heard; this is where it can be re-read, tomorrow, on another device.
  */
 export function ConversationsPanel() {
-  const { turns } = useConversation();
+  const { turns, loading } = useConversation();
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -40,7 +45,9 @@ export function ConversationsPanel() {
 
       <PanelRule />
 
-      {turns.length === 0 ? (
+      {loading ? (
+        <p className="px-3 py-7 text-center text-[0.75rem] text-ink-muted">Loading…</p>
+      ) : turns.length === 0 ? (
         <PanelEmpty icon={MessagesSquare}>
           No exchanges yet. Speak once and the thread starts here.
         </PanelEmpty>
@@ -60,6 +67,10 @@ export function ConversationsPanel() {
                   </div>
 
                   <Bubble speaker="You">{turn.text}</Bubble>
+
+                  {/* Between the question and the answer, because that is
+                      when it happened — the agent acted, then spoke. */}
+                  <Tools calls={turn.tools} />
 
                   <Reply turn={turn} />
                 </article>
@@ -83,10 +94,17 @@ function Bubble({
 }) {
   return (
     <div
+      /*
+        The two sides of the conversation are the two sides of the glass
+        system: the agent gets the light surface everything else in the panel
+        is made of, and the speaker gets the ink one. `.glass-ink` rather than
+        `.glass-dark` because a long thread renders one of these per turn, and
+        a `backdrop-filter` on each would be a compositor layer per turn.
+      */
       className={
         agent
-          ? "self-start rounded-xl rounded-bl-sm border border-line bg-surface-2 px-3 py-2"
-          : "max-w-[88%] self-end rounded-xl rounded-br-sm bg-ink px-3 py-2"
+          ? "glass-tile self-start rounded-xl rounded-bl-sm px-3 py-2"
+          : "glass-ink max-w-[88%] self-end rounded-xl rounded-br-sm px-3 py-2"
       }
     >
       <p
@@ -112,34 +130,96 @@ function Bubble({
 }
 
 /**
- * The agent's side of a turn. Three outcomes, and only one of them is text:
- * an abstention or a refusal is a real reply with no answer in it, so it gets
- * a bubble of its own rather than being left to look like a loading state.
+ * What the agent actually ran, under the turn that caused it.
+ *
+ * The one part of a conversation with an effect outside this app: a message
+ * can be re-read, an email is sent. So it is shown rather than left to be
+ * inferred from a reply that mentions it — and shown even when it failed,
+ * because "it tried and could not" is the thing worth knowing.
+ *
+ * No results. The backend keeps a result's size and never its content, so
+ * there is nothing here that could put somebody's inbox on screen.
+ */
+function Tools({ calls }: { calls: ToolCall[] }) {
+  if (calls.length === 0) return null;
+
+  return (
+    <ul className="flex flex-col gap-1 self-start">
+      {calls.map((call) => (
+        <li
+          key={call.id}
+          className="glass-dashed flex items-center gap-2 rounded-lg px-2.5 py-1.5"
+        >
+          <Wrench aria-hidden className="size-3 shrink-0 text-ink-muted" />
+          <span className="font-mono text-[0.66rem] text-ink-soft">{call.slug}</span>
+
+          {call.latencyMs !== null && (
+            <span className="text-[0.62rem] tabular-nums text-ink-muted">
+              {Math.round(call.latencyMs)} ms
+            </span>
+          )}
+
+          <span
+            className="ml-auto flex shrink-0 items-center gap-1 text-[0.62rem] text-ink-muted"
+            title={call.error ?? undefined}
+          >
+            {call.ok ? (
+              <Check aria-hidden className="size-2.5" />
+            ) : (
+              <X aria-hidden className="size-2.5 text-destructive" />
+            )}
+            {call.ok ? "ran" : (call.error ?? "failed")}
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** What a turn that produced no words says instead. */
+const NO_ANSWER: Record<string, string> = {
+  refused: "Declined that one.",
+  abstained: "Nothing in my sources covers that.",
+  interrupted: "Stopped before it said anything.",
+  error: "Something went wrong answering that one.",
+};
+
+/**
+ * The agent's side of a turn. Not every outcome is text: an abstention or a
+ * refusal is a real reply with no answer in it, so it gets a bubble of its own
+ * rather than being left to look like a loading state.
+ *
+ * A turn you talked over is the odd one — it has words *and* an ending worth
+ * marking, because what is stored is only what actually reached the speakers.
  */
 function Reply({ turn }: { turn: Turn }) {
-  if (turn.replyStatus === "answered" && turn.reply) {
+  if (turn.reply) {
     return (
-      <Bubble speaker="Vec" agent>
-        {turn.reply}
-      </Bubble>
+      <div className="flex flex-col items-start gap-1">
+        <Bubble speaker="Vec" agent>
+          {turn.reply}
+        </Bubble>
+        {turn.replyStatus === "interrupted" && (
+          <p className="px-1 text-[0.66rem] text-ink-muted">
+            Stopped here — you started talking.
+          </p>
+        )}
+      </div>
     );
   }
 
   if (turn.replyStatus) {
     return (
-      <div className="self-start rounded-xl rounded-bl-sm border border-dashed border-line px-3 py-2">
+      <div className="glass-dashed self-start rounded-xl rounded-bl-sm px-3 py-2">
         <p className="text-[0.72rem] leading-relaxed text-ink-muted">
-          {turn.replyReason ??
-            (turn.replyStatus === "refused"
-              ? "Declined that one."
-              : "Nothing in my sources covers that.")}
+          {turn.replyReason ?? NO_ANSWER[turn.replyStatus] ?? "No answer to that one."}
         </p>
       </div>
     );
   }
 
   return (
-    <div className="self-start rounded-xl rounded-bl-sm border border-dashed border-line px-3 py-2">
+    <div className="glass-dashed self-start rounded-xl rounded-bl-sm px-3 py-2">
       <p className="text-[0.72rem] leading-relaxed text-ink-muted">
         No reply — this take was transcribed only.
       </p>

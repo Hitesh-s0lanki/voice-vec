@@ -12,7 +12,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.router import api_router
+from src.chat.store import ChatStore, get_chat_store
 from src.core.config import Settings, get_settings
+from src.core.db import get_db
 from src.rag.embed import Embedder, get_embedder
 from src.rag.store import VectorStore, get_store
 from src.voice.http import close_client
@@ -54,9 +56,15 @@ async def lifespan(app: FastAPI):
     None of it runs with retrieval off. The voice loop calls no local model, so
     warming a 465 MB ONNX session it will not use costs seconds of boot and
     holds a pool open against a database this build never queries.
+
+    Conversation storage is the exception to that last part: it is needed
+    whether or not retrieval is on, so its two tables are created here on the
+    same pool, and a database that is missing or unreachable degrades to "this
+    build does not remember anything" rather than to a boot failure.
     """
     settings = get_settings()
     store: VectorStore | None = None
+    chat: ChatStore = get_chat_store()
     warm_loop: asyncio.Task | None = None
 
     llm = settings.resolve_llm()
@@ -69,6 +77,15 @@ async def lifespan(app: FastAPI):
     )
     if not llm.ready:
         log.warning("no reply model — set SARVAM_API_KEY or OPENAI_API_KEY in .env")
+
+    if chat.configured:
+        try:
+            await anyio.to_thread.run_sync(chat.ensure_schema)
+            log.info("conversations ready at %s", get_db().location)
+        except Exception as error:  # a wrong DSN, a database still booting…
+            log.warning("conversations unavailable (%s) — turns will not be saved", error)
+    else:
+        log.info("DATABASE_URL unset — conversations are not saved")
 
     if settings.rag_enabled:
         embedder = get_embedder()
