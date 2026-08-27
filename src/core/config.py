@@ -104,6 +104,32 @@ class Settings(BaseSettings):
     clerk_jwt_key: str = ""
     clerk_jwks_ttl_s: int = 3600
 
+    # ---- Composio (src/integrations/) -----------------------------------
+    # Composio is the connector, and *the user* connects it. There is no
+    # project-wide API key here on purpose: each signed-in account brings its
+    # own, so a toolkit connected through this app lands in that person's
+    # Composio project and not in one belonging to whoever deployed the server.
+    #
+    # That makes the key a real secret at rest, held per `user_id`, so it is
+    # encrypted before it reaches Postgres (src/integrations/crypto.py). This
+    # is the master key that encrypts them — 32 url-safe base64 bytes, exactly
+    # what `Fernet.generate_key()` prints:
+    #
+    #     uv run python -c "from cryptography.fernet import Fernet; \
+    #         print(Fernet.generate_key().decode())"
+    #
+    # Unset, nobody can connect Composio at all and the panel says so. Losing
+    # it or rotating it does not corrupt anything — every stored key simply
+    # stops decrypting, and each user reconnects. Never commit it: it is the
+    # one value in this file that is worth as much as the database.
+    composio_encryption_key: str = ""
+
+    # How many users' vector backends to keep built. Smaller than the Composio
+    # cache because these are more expensive to hold: a connected pgvector
+    # backend keeps a connection pool open against somebody else's database,
+    # and evicting one hands those connections back.
+    vector_backend_cache: int = 16
+
     # ---- Embedding ------------------------------------------------------
     # multilingual-e5-small: 384 dims, ONNX, ~3 ms per query on CPU. The ONNX
     # export lives in the same HF repo as the torch weights (`onnx/model.onnx`).

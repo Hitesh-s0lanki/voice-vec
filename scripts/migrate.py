@@ -17,6 +17,7 @@ import argparse
 import time
 
 from src.core.config import get_settings
+from src.connectors.store import ACCOUNTS, get_connector_store
 from src.rag.store import StoreUnavailable, get_store
 
 
@@ -65,6 +66,14 @@ def main() -> None:
 
     store.ensure_schema(settings.embed_dim, recreate=args.recreate)
     print(f"schema ready: {store.table} (vector({settings.embed_dim}))")
+
+    # Connectors — the outside services a user attaches to their account, with
+    # their credentials encrypted. Same reasoning again: needed whether or not
+    # retrieval is on, and in fact one of them *is* retrieval, since a
+    # connected vector store is what answers that user's questions
+    # (docs/13-connectors.md).
+    get_connector_store().ensure_schema()
+    print(f"schema ready: {ACCOUNTS}")
 
     if args.indexes:
         started = time.perf_counter()
