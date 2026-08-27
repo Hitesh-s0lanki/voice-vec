@@ -6,7 +6,8 @@ JSON frames carry everything you can read, binary frames carry PCM. A binary
 frame is always audio for the segment whose `speech.start` most recently
 arrived — which is why that event carries the format instead of each chunk.
 
-    → audio.start {mime}     ← status  {stage: transcribing}
+    → audio.start {mime}     ← conversation {id, created}
+                             ← status  {stage: transcribing}
     → <binary …>             ← activity {step: stt, state: start}
     → audio.end              ← transcript {text, languageCode}
                              ← status  {stage: thinking}
@@ -56,6 +57,21 @@ class Providers(Wire):
     llm_model: str | None
     tts: str | None
     rag_enabled: bool
+    #: The highest rung of the effort ladder this deployment will run. The
+    #: panel renders positions it can actually reach rather than a slider whose
+    #: top half quietly behaves like its middle (docs/15-effort.md).
+    effort_max: int = 4
+    #: The answer cache, as it actually resolved: "semantic", "exact-only",
+    #: "unset", "off". Not a boolean — the difference between the first two is
+    #: whether paraphrases are caught, and a deployment that thinks it has
+    #: semantic caching and does not will read its hit rate as a tuning problem.
+    cache: str = "unset"
+    #: Agent memory, as it actually resolved: "on", "unset", "off",
+    #: "unavailable (…)". Same vocabulary and the same reason as `cache` — the
+    #: difference between an agent that remembers across conversations and one
+    #: that does not is invisible until someone opens a second conversation and
+    #: reads it as the model having got worse (docs/16-memory.md).
+    memory: str = "unset"
 
 
 class Ready(Wire):
@@ -66,13 +82,29 @@ class Ready(Wire):
     languages: dict[str, str] = Field(description="Language code → English name")
 
 
+class ConversationEvent(Wire):
+    """Which conversation this socket is writing into.
+
+    Arrives twice over a session's life at most: once just after `ready` when
+    the client opened the socket against an existing `conv_…`, and once with
+    `created` set the first time someone says something worth keeping. The
+    client's cue to put `/c/{id}` in the address bar is the second one.
+    """
+
+    type: Literal["conversation"] = "conversation"
+    id: str
+    title: str | None = None
+    turns: int = 0
+    created: bool = Field(default=False, description="This turn opened it")
+
+
 class Status(Wire):
     type: Literal["status"] = "status"
     stage: Literal["idle", "transcribing", "thinking", "speaking"]
     turn_id: str | None = None
 
 
-ActivityStep = Literal["stt", "retrieval", "tool", "llm", "speech", "turn"]
+ActivityStep = Literal["stt", "memory", "retrieval", "tool", "llm", "speech", "turn"]
 
 ActivityState = Literal["start", "running", "done", "skipped", "error"]
 
@@ -146,6 +178,7 @@ class TurnEnd(Wire):
     reply: str
     language_code: str | None = None
     segments: int
+    tools: int = Field(default=0, description="Tools the agent ran this turn")
     timings: VoiceTimings
 
 

@@ -8,6 +8,13 @@ Streaming is not a nicety here. The synthesiser is fed from this stream, so the
 first sound the listener hears is gated on the first *clause*, not the last
 token: waiting for a finished reply would add its whole generation time to the
 silence before speech starts.
+
+`complete()` is the exception and exists for exactly one reason: a tool call
+cannot be streamed into a synthesiser. Deciding *whether* to call a tool is a
+whole-response question — the arguments arrive in fragments across many chunks
+and mean nothing until the last one — so that pass is buffered, and only the
+final answer, once the tools have run, goes through `stream_reply`. Nothing
+pays for it unless the caller passes tools.
 """
 
 from __future__ import annotations
@@ -15,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import AsyncIterator
 
 from src.core.config import LlmTarget, Settings
@@ -23,7 +31,38 @@ from src.voice.languages import LANGUAGES, display
 
 log = logging.getLogger("vec.voice.llm")
 
-Message = dict[str, str]
+# Loose on purpose. A plain turn is {"role", "content"}, but a tool round trip
+# adds an assistant message carrying `tool_calls` (a list) and tool results
+# carrying `tool_call_id`. Typing this as dict[str, str] would have been a lie
+# the moment tools arrived.
+Message = dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    """One tool the model asked for, with its arguments already parsed.
+
+    `arguments` arrives as a JSON *string* on the wire and is decoded here so
+    no caller has to remember to. A model that emits malformed JSON — which
+    happens — becomes an empty dict rather than an exception, because the tool
+    refusing sensibly is a better turn than the whole reply failing.
+    """
+
+    id: str
+    name: str
+    arguments: dict
+
+
+@dataclass(frozen=True, slots=True)
+class Completion:
+    """A buffered reply: what it said, and what it wants run."""
+
+    content: str
+    tool_calls: tuple[ToolCall, ...] = ()
+
+    @property
+    def wants_tools(self) -> bool:
+        return bool(self.tool_calls)
 
 # The chat-completions protocol is one thing; which of its parameters a given
 # model still accepts is another. OpenAI's newer models renamed `max_tokens` to
@@ -56,16 +95,26 @@ class _Incompatible(Exception):
         self.replacement = replacement
 
 
-def build_payload(messages: list[Message], *, settings: Settings, llm: LlmTarget) -> dict:
+def build_payload(
+    messages: list[Message],
+    *,
+    settings: Settings,
+    llm: LlmTarget,
+    stream: bool = True,
+    tools: list[dict] | None = None,
+) -> dict:
     """The request body, with the token cap spelled the way this provider wants."""
     cap = "max_completion_tokens" if llm.provider == "openai" else "max_tokens"
-    payload = {
+    payload: dict = {
         "model": llm.model,
         "messages": messages,
-        "stream": True,
+        "stream": stream,
         "temperature": settings.llm_temperature,
         cap: settings.llm_max_tokens,
     }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
     for field, replacement in _LEARNED.get(_key(llm), {}).items():
         if field in payload:
             value = payload.pop(field)
@@ -281,3 +330,107 @@ def _loads(raw: bytes) -> object:
         return json.loads(raw)
     except Exception:
         return raw.decode("utf-8", "replace")
+
+
+def _tool_calls(message: dict) -> tuple[ToolCall, ...]:
+    """The tool calls off a finished choice, parsed and filtered.
+
+    A call with no name is dropped rather than passed on: it cannot be routed
+    to anything, and letting it through would mean an execution layer deciding
+    what an unnamed tool means.
+    """
+    calls = []
+    for raw in message.get("tool_calls") or []:
+        function = raw.get("function") or {}
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+
+        try:
+            arguments = json.loads(function.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            # Models do emit malformed argument JSON. An empty dict lets the
+            # tool refuse on its own terms, which reads far better than the
+            # whole turn dying on a parse error.
+            log.info("tool %s sent arguments that would not parse", name)
+            arguments = {}
+
+        calls.append(
+            ToolCall(
+                id=str(raw.get("id") or ""),
+                name=name,
+                arguments=arguments if isinstance(arguments, dict) else {},
+            )
+        )
+    return tuple(calls)
+
+
+async def complete(
+    messages: list[Message],
+    *,
+    settings: Settings,
+    tools: list[dict] | None = None,
+    target: LlmTarget | None = None,
+) -> Completion:
+    """One buffered reply, so tool calls can be read whole.
+
+    The same parameter-learning retry as `stream_reply`, for the same reason:
+    the two share a provider and a model, so a rename learned here saves the
+    streaming pass a wasted round trip and vice versa.
+
+    A model that rejects `tools` outright degrades to answering without them —
+    `adapt_payload` drops the parameter and the retry goes through — which is
+    the right outcome for a provider that has no tool support at all.
+    """
+    llm = target or settings.resolve_llm()
+    if not llm.ready:
+        raise ProviderError(
+            "No reply model is configured — set OPENAI_API_KEY or SARVAM_API_KEY.",
+            provider="none",
+        )
+
+    payload = build_payload(messages, settings=settings, llm=llm, stream=False, tools=tools)
+
+    for _ in range(len(payload)):
+        try:
+            return await _complete_once(payload, llm=llm)
+        except _Incompatible as retry:
+            log.info(
+                "%s rejected %r on %s; sending %s from here on",
+                llm.provider,
+                retry.field,
+                llm.model,
+                retry.replacement or "nothing in its place",
+            )
+            _LEARNED.setdefault(_key(llm), {})[retry.field] = retry.replacement
+            payload = retry.payload
+
+    return Completion(content="")
+
+
+async def _complete_once(payload: dict, *, llm: LlmTarget) -> Completion:
+    """One attempt. Raises `_Incompatible` if the model refused a parameter."""
+    client = get_client()
+    response = await client.post(
+        f"{llm.base_url}/chat/completions",
+        headers={"authorization": f"Bearer {llm.api_key}"},
+        json=payload,
+    )
+
+    if response.status_code >= 400:
+        body = _loads(response.content)
+        message = read_error(body, f"{llm.provider} responded with {response.status_code}.")
+        adapted = adapt_payload(payload, message) if response.status_code == 400 else None
+        if adapted is not None:
+            raise _Incompatible(*adapted)
+        raise ProviderError(message, status=response.status_code, provider=llm.provider)
+
+    choices = (response.json() or {}).get("choices") or []
+    if not choices:
+        return Completion(content="")
+
+    message = choices[0].get("message") or {}
+    return Completion(
+        content=str(message.get("content") or ""),
+        tool_calls=_tool_calls(message),
+    )

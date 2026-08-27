@@ -34,24 +34,29 @@ This unifies requirements 3, 5 and 6 into one mechanism: **a confidence-gated la
 
 ## The ladder
 
-Four tiers. They map onto the four levels already sitting in
-[`EffortPanel`](../frontend/src/components/panels/effort-panel.tsx), which is a happy accident worth
-keeping.
+Five rungs, and the four levels already sitting in
+[`EffortPanel`](../frontend/src/components/panels/effort-panel.tsx) grew one to hold them.
+Each rung is a different **retrieval architecture**, not a different amount of the same one —
+the full treatment is in [15-effort.md](15-effort.md).
 
-| Tier | UI label | What runs | Network calls | Budget |
+| Rung | UI label | What runs | Network calls | Budget |
 | --- | --- | --- | --- | --- |
-| 0 | — | Input guardrail rejects or abstains | 0 | ~5 ms |
-| 1 | Instant | Embed → search → extractive span → grounding check | 0 | **< 200 ms** |
-| 2 | Balanced | Tier 1 + cross-encoder rerank of top-k | 0 | < 200 ms (target) |
-| 3 | Deep / Max | Tier 2 + LLM synthesis over retrieved context | 1 | ~700–1200 ms |
+| 0 | Lookup | Gate 1 → embed → search → Gate 2. The passages, as they are. | 0 | ~60 ms |
+| 1 | Grounded | + answer cache, extractive span, grounding check | 0 | **< 200 ms** |
+| 2 | Deep | + hybrid retrieval, rerank, LLM synthesis, Gate 4 | 1 | ~1 s |
+| 3 | Corrective | + relevance grading, query rewrite, one re-retrieval | 3–6 | ~5 s |
+| 4 | Adaptive | + routing before retrieval, capped repair loop | 4–8 | ~10 s |
 
-**Tier 1 is the default and is what the 200 ms claim refers to.** Tier 3 deliberately
-exceeds it, and we report its latency separately rather than hiding it. Trading latency for
-quality on explicit user request is a defensible engineering decision; quietly reporting
-only the fast tier is not. See [04-latency.md](04-latency.md) for how this is presented.
+**Rung 1 is the default and is what the 200 ms claim refers to.** Rungs 2 and up deliberately
+exceed it, are measured against their own budget, and report it as `budgetMs` on every answer
+rather than hiding behind the fast tier's number. See [04-latency.md](04-latency.md) for how
+this is presented.
 
-Escalation is automatic on low confidence *and* manual via the effort slider. A query can
-also terminate at any tier by **abstaining** — see [06-guardrails.md](06-guardrails.md).
+The rung is a **ceiling, not a floor**: it says how far the pipeline may escalate, never how
+far it must. A question the answer cache already holds costs one local embedding at rung 4, and
+a rung whose stages are unavailable falls through to the rung below rather than failing — which
+is why every response carries `mode` (asked for) beside `tier` (what answered). A query can also
+terminate at any rung by **abstaining** — see [06-guardrails.md](06-guardrails.md).
 
 ## End-to-end flow
 
