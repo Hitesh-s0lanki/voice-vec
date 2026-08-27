@@ -42,7 +42,7 @@ export function TryAsking({
               onClick={() => onPick(starter.text, starter.language)}
               lang={starter.language}
               title={starter.label}
-              className="glass glass-hover flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[0.78rem] text-ink-soft disabled:opacity-40"
+              className="glass glass-hover flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[0.78rem] text-ink-soft disabled:pointer-events-none disabled:opacity-40"
             >
               {starter.text}
               <CornerDownLeft aria-hidden className="size-3 shrink-0 text-ink-muted" />

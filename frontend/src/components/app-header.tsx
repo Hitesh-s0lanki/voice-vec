@@ -10,7 +10,7 @@ export function AppHeader() {
     <header className="pointer-events-none fixed inset-x-0 top-0 z-40 flex items-center px-6 py-5">
       <Link
         href="/"
-        className="pointer-events-auto flex items-center gap-2.5 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ink/30 focus-visible:ring-offset-4 focus-visible:ring-offset-canvas"
+        className="glass-row pointer-events-auto -mx-2 flex items-center gap-2.5 rounded-full px-2 py-1 outline-none focus-visible:ring-2 focus-visible:ring-ink/30 focus-visible:ring-offset-4 focus-visible:ring-offset-canvas"
       >
         {/*
           The artwork is a dark circle inset in an opaque near-white square.

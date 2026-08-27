@@ -46,7 +46,8 @@ export function TranscriptCard({
 
   const listening = status === "listening";
   // Mid-take the previous take's words are stale — the live state stands in.
-  const stale = listening || status === "connecting" || status === "transcribing";
+  const stale =
+    listening || status === "connecting" || status === "transcribing";
   const heard = stale ? "" : (exchange?.question ?? "");
   // Still waiting on words: the take is on its way to Saaras, or this is a
   // typed turn that went straight to thinking without one.
@@ -89,19 +90,23 @@ export function TranscriptCard({
         "md:fixed md:bottom-16 md:left-5 md:z-40 md:w-80 lg:bottom-5",
       )}
     >
-      <PanelHeading
-        title="Transcript"
-        hint={HINT[status] ?? (pending ? "Waiting on the words" : "What Vec heard")}
-      >
+      <PanelHeading title="Transcript">
         {heard && (
           <Button
             type="button"
             variant="ghost"
             size="sm"
             onClick={copy}
-            className="glass-hover -mt-0.5 rounded-full text-ink-muted"
+            // no `.glass-hover`: that one is for a surface floating over the
+            // stage. This button sits *on* glass, where the row treatment the
+            // ghost variant already carries is the one that reads.
+            className="-mt-0.5 rounded-full text-ink-muted"
           >
-            {copied ? <Check aria-hidden className="text-ink" /> : <Copy aria-hidden />}
+            {copied ? (
+              <Check aria-hidden className="text-ink" />
+            ) : (
+              <Copy aria-hidden />
+            )}
             {copied ? "Copied" : "Copy"}
           </Button>
         )}
@@ -141,17 +146,21 @@ export function TranscriptCard({
         )}
       </div>
 
-      {heard && (exchange?.language || exchange?.timings || exchange?.interrupted) && (
-        <div className="flex flex-wrap items-center gap-1.5 px-2 pb-0.5 text-[0.68rem] text-ink-muted">
-          {exchange.language && <PanelChip>{exchange.language}</PanelChip>}
-          {exchange.timings?.firstAudio != null && (
-            <span className="tabular-nums" title="Silence before the first sound">
-              spoke in {(exchange.timings.firstAudio / 1000).toFixed(1)}s
-            </span>
-          )}
-          {exchange.interrupted && <PanelChip>Interrupted</PanelChip>}
-        </div>
-      )}
+      {heard &&
+        (exchange?.language || exchange?.timings || exchange?.interrupted) && (
+          <div className="flex flex-wrap items-center gap-1.5 px-2 pb-0.5 text-[0.68rem] text-ink-muted">
+            {exchange.language && <PanelChip>{exchange.language}</PanelChip>}
+            {exchange.timings?.firstAudio != null && (
+              <span
+                className="tabular-nums"
+                title="Silence before the first sound"
+              >
+                spoke in {(exchange.timings.firstAudio / 1000).toFixed(1)}s
+              </span>
+            )}
+            {exchange.interrupted && <PanelChip>Interrupted</PanelChip>}
+          </div>
+        )}
 
       {/* the reply has no text on screen, so its one control has to live here */}
       {speaking && (
@@ -159,7 +168,10 @@ export function TranscriptCard({
           <PanelRule />
           <div className="flex items-center justify-between gap-3 px-1 pb-0.5">
             <span className="flex items-center gap-2 text-[0.72rem] font-medium tracking-wide text-ink-soft">
-              <Radio aria-hidden className="size-3.5 animate-pulse text-ink-muted" />
+              <Radio
+                aria-hidden
+                className="size-3.5 animate-pulse text-ink-muted"
+              />
               Speaking the reply
             </span>
             <Button
@@ -167,7 +179,7 @@ export function TranscriptCard({
               variant="ghost"
               size="sm"
               onClick={onStop}
-              className="glass-hover rounded-full text-ink-muted"
+              className="rounded-full text-ink-muted"
             >
               <Square aria-hidden />
               Stop

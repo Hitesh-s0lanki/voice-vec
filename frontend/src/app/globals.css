@@ -1,6 +1,8 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
+/* Clerk's components, themed off the same shadcn tokens as everything else. */
+@import "@clerk/ui/themes/shadcn.css";
 
 /* ---------------------------------------------------------------
    Vec — voice theme
@@ -101,46 +103,110 @@
   --tone-strong: #26262d;
 
   /* depth */
-  --lift: 0 1px 2px rgb(16 16 20 / 0.04), 0 14px 34px -16px rgb(16 16 20 / 0.16);
-  --lift-lg: 0 1px 2px rgb(16 16 20 / 0.05),
-    0 34px 76px -34px rgb(16 16 20 / 0.24);
+  --lift: 0 1px 2px rgb(16 16 20 / 0.05), 0 16px 38px -18px rgb(16 16 20 / 0.18);
+  --lift-lg: 0 1px 2px rgb(16 16 20 / 0.06),
+    0 38px 84px -36px rgb(16 16 20 / 0.28);
   --shadow-lift: 0 24px 60px -28px rgb(16 16 20 / 0.25);
 
   --stage: #ffffff;
 
+  /*
+   * Ambient — the room behind the glass.
+   *
+   * Glass is only glass if there is something to refract. The room is still
+   * the plain white one, but no longer *flat* white: three very low-saturation
+   * washes give every translucent surface something to pick up and every
+   * hairline edge somewhere to catch light. Pull the washes and the whole
+   * system below collapses back into white-on-white.
+   *
+   * The grain is not decoration. Those washes are wide and shallow, which is
+   * the exact shape that bands into visible rings on an 8-bit display; the
+   * noise dithers them. It rides on top of the washes and under everything
+   * else.
+   */
+  --wash-cool: rgb(106 124 166 / 0.1);
+  --wash-warm: rgb(178 146 122 / 0.075);
+  --wash-mint: rgb(118 154 146 / 0.065);
+  --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' opacity='0.09'/%3E%3C/svg%3E");
+  --ambient: var(--grain),
+    radial-gradient(78% 58% at 8% -8%, var(--wash-cool) 0%, transparent 62%),
+    radial-gradient(66% 52% at 98% 2%, var(--wash-warm) 0%, transparent 60%),
+    radial-gradient(88% 64% at 46% 114%, var(--wash-mint) 0%, transparent 64%);
+
+  /*
+   * Glass — the four ingredients every surface in the system is built from.
+   *
+   *   tint    translucent white ground; denser the more text sits on it
+   *   sheen   1px inset highlight along the top edge, where light lands
+   *   ring    a second inset hairline just inside the border, so the edge
+   *           reads as a thickness rather than as a drawn line
+   *   facet   an off-axis gradient across the face — the reason two glass
+   *           cards side by side don't look like one flat sheet
+   */
+  --glass: rgb(255 255 255 / 0.5);
+  --glass-strong: rgb(255 255 255 / 0.72);
+  --glass-dense: rgb(255 255 255 / 0.82);
+  --glass-sheen: rgb(255 255 255 / 0.85);
+  --glass-ring: rgb(255 255 255 / 0.3);
+  --glass-facet: linear-gradient(
+    155deg,
+    rgb(255 255 255 / 0.5) 0%,
+    rgb(255 255 255 / 0.06) 46%,
+    rgb(255 255 255 / 0.32) 100%
+  );
+  --glass-blur: 18px;
+  --glass-blur-lg: 28px;
+
+  /*
+   * Hover — one tint, two directions. A surface floating over the ambient
+   * brightens towards opaque white; a row already sitting on a near-white
+   * panel has nowhere brighter to go, so it darkens instead. Same gesture,
+   * opposite sign, because the ground underneath is different.
+   */
+  --hover-tint: rgb(16 16 20 / 0.05);
+  --hover-tint-strong: rgb(16 16 20 / 0.08);
+  --hover-ease: 200ms cubic-bezier(0.22, 1, 0.36, 1);
+
   /* shadcn */
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
+  /*
+   * shadcn's ramp, re-pointed at the glass tokens above rather than at flat
+   * greys. Every primitive built on it — Button, Popover, Slider, and Clerk's
+   * components, which read the same variables — turns to glass here instead of
+   * in each component file. `--background` and the `*-foreground` pairs stay
+   * opaque: they are text colours and a solid ground of last resort.
+   */
+  --card: var(--glass);
   --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
+  --popover: var(--glass-dense);
   --popover-foreground: oklch(0.145 0 0);
   --primary: oklch(0.205 0 0);
   --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
+  --secondary: var(--glass);
   --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
+  --muted: var(--hover-tint);
   --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
+  --accent: var(--hover-tint);
   --accent-foreground: oklch(0.205 0 0);
   --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
+  --border: var(--line);
+  --input: var(--line);
+  --ring: rgb(16 16 20 / 0.32);
   --chart-1: oklch(0.87 0 0);
   --chart-2: oklch(0.556 0 0);
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
   --radius: 0.625rem;
-  --sidebar: oklch(0.985 0 0);
+  --sidebar: var(--glass);
   --sidebar-foreground: oklch(0.145 0 0);
   --sidebar-primary: oklch(0.205 0 0);
   --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent: var(--hover-tint);
   --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+  --sidebar-border: var(--line);
+  --sidebar-ring: rgb(16 16 20 / 0.32);
 }
 
 @layer base {
@@ -151,7 +217,14 @@
     @apply font-sans;
   }
   body {
-    background: var(--canvas);
+    /*
+     * Fixed, so the washes belong to the viewport rather than to the
+     * document — nothing shifts under a scrolling panel, and `.stage` can
+     * paint the identical stack without a seam where the two meet.
+     */
+    background-color: var(--canvas);
+    background-image: var(--ambient);
+    background-attachment: fixed;
     color: var(--ink);
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
@@ -202,39 +275,75 @@
 }
 
 /* ---------------------------------------------------------------
-   Stage — the room the orb sits in. Flat white; the film grain that used
-   to sit on top of it went with the gradients it was there to de-band.
+   Stage — the room the orb sits in.
+
+   It paints `--ambient` itself rather than letting the body's copy show
+   through, and it has to: `isolation` makes this element a backdrop root, so
+   a `backdrop-filter` anywhere inside samples only what is painted *within*
+   the stage. Leave it transparent and every glass surface on this screen
+   blurs an empty backdrop — which is to say, nothing. `fixed` on both copies
+   is what keeps the two stacks aligned to the same viewport origin, so the
+   boundary between stage and body is invisible.
    --------------------------------------------------------------- */
 
 .stage {
   position: relative;
   isolation: isolate;
-  background: var(--stage);
+  background-color: var(--stage);
+  background-image: var(--ambient);
+  background-attachment: fixed;
 }
 
 /* ---------------------------------------------------------------
-   Glass — the shared card / pill / rail surface
+   Glass — the surface system
+
+   Every surface in the app is one of the six below, and they differ only in
+   how much of the room shows through:
+
+     .glass        floating card, pill, rail — over the ambient stage
+     .glass-panel  a popover full of list text — near-opaque, heavily blurred
+     .glass-field  an input, pressed *into* the surface rather than onto it
+     .glass-chip   a state pill, small enough that a blur would be wasted
+     .glass-dark   the ink-side surface: tooltips, the speaker's own bubble
+     .glass-track  a recess — slider rail, meter groove
+
+   Only the first two and `.glass-dark` get `backdrop-filter`. A row or a chip
+   inside a panel is already sitting on blurred pixels; blurring them again
+   costs a compositor layer apiece and reads as mud, not as depth.
+
+   None of these set `position`. This block is unlayered and so is emitted
+   after Tailwind's utilities — a `position` here would silently beat the
+   `fixed` on the rail and the activity feed.
    --------------------------------------------------------------- */
 
 .glass {
-  background: var(--surface);
+  background-color: var(--glass);
+  background-image: var(--glass-facet);
   border: 1px solid var(--line);
-  box-shadow: var(--lift);
-  backdrop-filter: blur(16px) saturate(1.4);
-  -webkit-backdrop-filter: blur(16px) saturate(1.4);
+  box-shadow:
+    inset 0 1px 0 var(--glass-sheen),
+    inset 0 0 0 1px var(--glass-ring),
+    var(--lift);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.7);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.7);
 }
 
 /*
  * Denser glass for the rail popovers. `.glass` is tuned for pills and cards
  * that sit over the stage; a panel full of list text needs a ground close to
- * opaque, or the orb reads straight through the words behind it.
+ * opaque, or the orb reads straight through the words behind it. The extra
+ * blur is what buys back the ~18% of transparency the tint gives up.
  */
 .glass-panel {
-  background: color-mix(in srgb, var(--shell) 94%, transparent);
+  background-color: var(--glass-dense);
+  background-image: var(--glass-facet);
   border: 1px solid var(--line);
-  box-shadow: var(--lift-lg);
-  backdrop-filter: blur(24px) saturate(1.4);
-  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  box-shadow:
+    inset 0 1px 0 var(--glass-sheen),
+    inset 0 0 0 1px var(--glass-ring),
+    var(--lift-lg);
+  backdrop-filter: blur(var(--glass-blur-lg)) saturate(1.7);
+  -webkit-backdrop-filter: blur(var(--glass-blur-lg)) saturate(1.7);
 }
 
 /*
@@ -246,23 +355,292 @@
   border-color: var(--line-strong);
 }
 
-.glass-hover {
-  transition:
-    background 220ms ease,
-    border-color 220ms ease,
-    color 220ms ease,
-    transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+/* An error banner inside a panel — the destructive tint, kept translucent. */
+.glass-alert {
+  background-color: color-mix(in srgb, var(--destructive) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--destructive) 22%, transparent);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.4);
 }
 
-.glass-hover:hover {
-  background: var(--surface-2);
+/* Small state pill: language, tier, connection status. */
+.glass-chip {
+  background-color: rgb(255 255 255 / 0.46);
+  border: 1px solid var(--line);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.7);
+}
+
+/* The square that holds a connector's logo or a lock. Chip, with a face. */
+.glass-tile {
+  background-color: rgb(255 255 255 / 0.5);
+  background-image: var(--glass-facet);
+  border: 1px solid var(--line);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.75),
+    0 1px 2px rgb(16 16 20 / 0.05);
+}
+
+/*
+ * A field is the one surface that goes *in* rather than on: the sheen moves
+ * to a shadow cast down from the top edge, which is what reads as a recess.
+ */
+.glass-field {
+  background-color: rgb(255 255 255 / 0.42);
+  border: 1px solid var(--line);
+  box-shadow: inset 0 1px 2px rgb(16 16 20 / 0.05);
+  transition:
+    background-color var(--hover-ease),
+    border-color var(--hover-ease),
+    box-shadow var(--hover-ease);
+}
+
+.glass-field:hover {
+  background-color: rgb(255 255 255 / 0.6);
   border-color: var(--line-strong);
+}
+
+/* `focus-within` covers the label-wrapping-an-input case as well as the input */
+.glass-field:focus,
+.glass-field:focus-within {
+  background-color: rgb(255 255 255 / 0.76);
+  border-color: rgb(16 16 20 / 0.34);
+  box-shadow:
+    inset 0 1px 2px rgb(16 16 20 / 0.04),
+    0 0 0 3px rgb(16 16 20 / 0.06);
+  outline: none;
+}
+
+/* A groove cut into whatever it sits on — slider rail, confidence meter. */
+.glass-track {
+  background-color: rgb(16 16 20 / 0.09);
+  box-shadow: inset 0 1px 2px rgb(16 16 20 / 0.07);
+}
+
+/*
+ * The ink side. Used where a surface has to read as the *other* speaker —
+ * a tooltip over anything, the person's own bubble in the thread — and the
+ * one place white-on-white glass would say nothing at all.
+ */
+.glass-dark {
+  background-color: color-mix(in srgb, var(--ink) 86%, transparent);
+  border: 1px solid rgb(255 255 255 / 0.14);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.18),
+    var(--lift);
+  backdrop-filter: blur(14px) saturate(1.5);
+  -webkit-backdrop-filter: blur(14px) saturate(1.5);
+}
+
+/*
+ * The same ink surface with the blur taken off, for the case where there are
+ * many of them at once — one bubble per turn in a thread. `backdrop-filter`
+ * costs a compositor layer apiece, and a list is exactly where that adds up.
+ */
+.glass-ink {
+  background-color: color-mix(in srgb, var(--ink) 92%, transparent);
+  background-image: linear-gradient(
+    160deg,
+    rgb(255 255 255 / 0.14),
+    rgb(255 255 255 / 0) 55%
+  );
+  border: 1px solid rgb(255 255 255 / 0.1);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.16),
+    0 1px 2px rgb(16 16 20 / 0.12);
+}
+
+/* Paints the tooltip arrow to match `.glass-dark`, which cannot reach it. */
+.glass-dark-edge {
+  background-color: color-mix(in srgb, var(--ink) 86%, transparent);
+  fill: color-mix(in srgb, var(--ink) 86%, transparent);
+}
+
+/* An outline that means "nothing here" — an unanswered turn, an empty slot. */
+.glass-dashed {
+  background-color: rgb(255 255 255 / 0.32);
+  border: 1px dashed var(--line-strong);
+}
+
+/*
+ * The one opaque surface left: a primary button. It keeps the sheen so it
+ * still belongs to the system, but it is ink through and through — glass has
+ * to sit *against* something, and this is what the rest of it sits against.
+ */
+.glass-solid {
+  background-image: linear-gradient(
+    180deg,
+    rgb(255 255 255 / 0.18),
+    rgb(255 255 255 / 0) 62%
+  );
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.22),
+    var(--lift);
+}
+
+/*
+ * The orb's face. Glass, and pointedly *not* `backdrop-filter` glass: this
+ * disc is ~300px across and its scale is driven off the analyser at 110ms
+ * while anything is making sound, so a real blur would be re-rasterised every
+ * animation frame for the whole of every take. The convex read comes from the
+ * shadows instead — a bright band along the top edge, a soft occlusion along
+ * the bottom — which costs one paint and holds up at any size.
+ */
+.glass-lens {
+  background-color: rgb(255 255 255 / 0.34);
+  background-image: var(--glass-facet);
+  border: 1px solid var(--line);
+  box-shadow:
+    inset 0 2px 0 rgb(255 255 255 / 0.8),
+    inset 0 0 0 1px rgb(255 255 255 / 0.35),
+    inset 0 -26px 50px -34px rgb(16 16 20 / 0.34),
+    var(--lift);
+}
+
+/* ---------------------------------------------------------------
+   Hover — one gesture, two directions
+
+   `.glass-hover` is for something floating over the ambient stage: it
+   brightens towards opaque white and lifts a pixel, the way a card picks up
+   light as it comes off the ground.
+
+   `.glass-row` is for a row or a button *inside* a panel. That panel is
+   already 82% white, so there is nothing brighter to move towards — the tint
+   goes the other way and the hairline edge fades in, which is the only pair
+   of changes that reads at all on that ground. It does not lift: a row that
+   translates inside a scrolling list looks like the list moved.
+
+   Both also answer to the states a control can be *left* in — open, pressed,
+   current — so the same class covers hover and selection without a second
+   set of utilities per call site.
+   --------------------------------------------------------------- */
+
+.glass-hover {
+  transition:
+    background-color var(--hover-ease),
+    border-color var(--hover-ease),
+    box-shadow var(--hover-ease),
+    color var(--hover-ease),
+    transform var(--hover-ease);
+}
+
+.glass-hover:hover,
+.glass-hover:focus-visible {
+  background-color: var(--glass-strong);
+  border-color: var(--line-strong);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.95),
+    inset 0 0 0 1px rgb(255 255 255 / 0.4),
+    var(--lift-lg);
   color: var(--ink);
   transform: translateY(-1px);
 }
 
 .glass-hover:active {
   transform: translateY(0);
+}
+
+.glass-row {
+  border: 1px solid transparent;
+  background-color: transparent;
+  transition:
+    background-color var(--hover-ease),
+    border-color var(--hover-ease),
+    box-shadow var(--hover-ease),
+    color var(--hover-ease);
+}
+
+.glass-row:hover,
+.glass-row:focus-visible {
+  background-color: var(--hover-tint);
+  border-color: var(--line);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.6);
+}
+
+/*
+ * Selected, and staying that way. `aria-current` is the history list, the
+ * two `data-state`s are Radix's popover triggers, `aria-pressed` is the
+ * hands-free toggle, `data-active` is everything with no ARIA of its own.
+ * One step past hover, so a hovered row and the open one stay distinct.
+ */
+.glass-row[aria-current]:not([aria-current="false"]),
+.glass-row[aria-pressed="true"],
+.glass-row[aria-expanded="true"],
+.glass-row[data-state="open"],
+.glass-row[data-state="active"],
+.glass-row[data-active="true"] {
+  background-color: var(--hover-tint-strong);
+  border-color: var(--line-strong);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.7);
+  color: var(--ink);
+}
+
+/*
+ * The same held states, for a floating surface rather than a row. It has to
+ * be a rule here and not an `aria-pressed:*` utility at the call site: `.glass`
+ * sets `background` and `border` outright from this same unlayered block, and
+ * would beat the utility at equal specificity whatever the variant.
+ */
+.glass-hover[aria-pressed="true"],
+.glass-hover[aria-expanded="true"],
+.glass-hover[data-state="open"] {
+  background-color: var(--glass-strong);
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+/* A destructive control keeps the same gesture, in the destructive hue. */
+.glass-row-danger:hover,
+.glass-row-danger:focus-visible {
+  background-color: color-mix(in srgb, var(--destructive) 10%, transparent);
+  border-color: color-mix(in srgb, var(--destructive) 24%, transparent);
+  color: var(--destructive);
+}
+
+/*
+ * No `backdrop-filter` — an old Firefox, or a browser with it switched off.
+ * Everything above degrades to a flat translucent panel, which over the
+ * ambient washes is unreadable at these tints. Push them to near-opaque and
+ * let the borders carry the structure instead.
+ */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass {
+    background-color: rgb(255 255 255 / 0.9);
+  }
+
+  .glass-panel {
+    background-color: rgb(255 255 255 / 0.97);
+  }
+
+  .glass-dark {
+    background-color: var(--ink);
+  }
+}
+
+/*
+ * Clerk's own components. Their shadcn theme already reads `--card`,
+ * `--popover` and `--border` from the block above, so they arrive here
+ * translucent — but a translucent surface with no blur behind it is not glass,
+ * it is just washed out. This is the half Clerk's theme cannot supply. It runs
+ * after `@clerk/ui/themes/shadcn.css` (imported at the top of this file) and
+ * so wins at equal specificity.
+ */
+.cl-cardBox,
+.cl-card,
+.cl-modalContent,
+.cl-userButtonPopoverCard,
+.cl-organizationSwitcherPopoverCard {
+  background-color: var(--glass-dense);
+  border: 1px solid var(--line);
+  box-shadow:
+    inset 0 1px 0 var(--glass-sheen),
+    inset 0 0 0 1px var(--glass-ring),
+    var(--lift-lg);
+  backdrop-filter: blur(var(--glass-blur-lg)) saturate(1.7);
+  -webkit-backdrop-filter: blur(var(--glass-blur-lg)) saturate(1.7);
+}
+
+/* the footer strip Clerk tucks under the card reads as a second, softer pane */
+.cl-footer {
+  background-color: rgb(255 255 255 / 0.4);
 }
 
 /* hairline across the top of the transcript card */
@@ -562,7 +940,44 @@
   .wave-bar,
   .orb-bar,
   .orb,
-  .glass-hover {
+  .glass-hover,
+  .glass-row,
+  .glass-field {
     transition: none;
   }
+
+  /* the lift is the one hover change that moves something */
+  .glass-hover:hover,
+  .glass-hover:focus-visible {
+    transform: none;
+  }
+}
+
+/* ---------------------------------------------------------------
+   Scrollbars — `scrollbar-thin` is referenced by the transcript card and the
+   stage column, and until now resolved to nothing. Kept to the glass
+   vocabulary: a hairline groove, ink at the same weight as a row hover.
+   --------------------------------------------------------------- */
+
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(16 16 20 / 0.18) transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgb(16 16 20 / 0.18);
+  border-radius: 9999px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: rgb(16 16 20 / 0.3);
 }

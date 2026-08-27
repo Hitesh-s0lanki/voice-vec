@@ -65,7 +65,10 @@ export function PanelChip({
     <span
       title={title}
       className={cn(
-        "rounded-full border border-line px-2 py-0.5 text-[0.66rem] font-medium tracking-wide text-ink-muted",
+        // `.glass-chip` brings its own border — a `border-line` utility here
+        // would be overridden by it anyway, since the glass classes are
+        // unlayered and land after the utilities.
+        "glass-chip rounded-full px-2 py-0.5 text-[0.66rem] font-medium tracking-wide text-ink-muted",
         className,
       )}
     >
