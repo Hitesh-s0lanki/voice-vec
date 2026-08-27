@@ -1,0 +1,188 @@
+{
+  "n": 200,
+  "seed": 42,
+  "margin": 0.02,
+  "means": {
+    "hindi": {
+      "top": 0.8945,
+      "margin": 0.0241,
+      "recall@5": 0.6885
+    },
+    "english": {
+      "top": 0.8467,
+      "margin": 0.0179,
+      "recall@5": 0.6475
+    },
+    "english_native": {
+      "top": 0.907,
+      "margin": 0.0265,
+      "recall@5": 0.9098
+    }
+  },
+  "sweep": [
+    {
+      "floor": 0.7,
+      "answered": 42,
+      "answered_with_gold_top5": 33,
+      "coverage": 0.3443,
+      "unanswerable_leaked": 19,
+      "abstention_recall": 0.7564
+    },
+    {
+      "floor": 0.72,
+      "answered": 42,
+      "answered_with_gold_top5": 33,
+      "coverage": 0.3443,
+      "unanswerable_leaked": 19,
+      "abstention_recall": 0.7564
+    },
+    {
+      "floor": 0.74,
+      "answered": 42,
+      "answered_with_gold_top5": 33,
+      "coverage": 0.3443,
+      "unanswerable_leaked": 19,
+      "abstention_recall": 0.7564
+    },
+    {
+      "floor": 0.76,
+      "answered": 42,
+      "answered_with_gold_top5": 33,
+      "coverage": 0.3443,
+      "unanswerable_leaked": 19,
+      "abstention_recall": 0.7564
+    },
+    {
+      "floor": 0.78,
+      "answered": 42,
+      "answered_with_gold_top5": 33,
+      "coverage": 0.3443,
+      "unanswerable_leaked": 19,
+      "abstention_recall": 0.7564
+    },
+    {
+      "floor": 0.8,
+      "answered": 41,
+      "answered_with_gold_top5": 32,
+      "coverage": 0.3361,
+      "unanswerable_leaked": 19,
+      "abstention_recall": 0.7564
+    },
+    {
+      "floor": 0.82,
+      "answered": 40,
+      "answered_with_gold_top5": 32,
+      "coverage": 0.3279,
+      "unanswerable_leaked": 19,
+      "abstention_recall": 0.7564
+    },
+    {
+      "floor": 0.845,
+      "answered": 32,
+      "answered_with_gold_top5": 26,
+      "coverage": 0.2623,
+      "unanswerable_leaked": 16,
+      "abstention_recall": 0.7949
+    },
+    {
+      "floor": 0.86,
+      "answered": 16,
+      "answered_with_gold_top5": 13,
+      "coverage": 0.1311,
+      "unanswerable_leaked": 11,
+      "abstention_recall": 0.859
+    }
+  ],
+  "margin_sweep": {
+    "0.005": {
+      "hindi": {
+        "floor": 0.845,
+        "answered": 116,
+        "answered_with_gold_top5": 82,
+        "coverage": 0.9508,
+        "unanswerable_leaked": 70,
+        "abstention_recall": 0.1026
+      },
+      "english": {
+        "floor": 0.78,
+        "answered": 113,
+        "answered_with_gold_top5": 77,
+        "coverage": 0.9262,
+        "unanswerable_leaked": 66,
+        "abstention_recall": 0.1538
+      }
+    },
+    "0.01": {
+      "hindi": {
+        "floor": 0.845,
+        "answered": 96,
+        "answered_with_gold_top5": 69,
+        "coverage": 0.7869,
+        "unanswerable_leaked": 54,
+        "abstention_recall": 0.3077
+      },
+      "english": {
+        "floor": 0.78,
+        "answered": 89,
+        "answered_with_gold_top5": 67,
+        "coverage": 0.7295,
+        "unanswerable_leaked": 55,
+        "abstention_recall": 0.2949
+      }
+    },
+    "0.015": {
+      "hindi": {
+        "floor": 0.845,
+        "answered": 73,
+        "answered_with_gold_top5": 58,
+        "coverage": 0.5984,
+        "unanswerable_leaked": 42,
+        "abstention_recall": 0.4615
+      },
+      "english": {
+        "floor": 0.78,
+        "answered": 66,
+        "answered_with_gold_top5": 49,
+        "coverage": 0.541,
+        "unanswerable_leaked": 37,
+        "abstention_recall": 0.5256
+      }
+    },
+    "0.02": {
+      "hindi": {
+        "floor": 0.845,
+        "answered": 64,
+        "answered_with_gold_top5": 49,
+        "coverage": 0.5246,
+        "unanswerable_leaked": 30,
+        "abstention_recall": 0.6154
+      },
+      "english": {
+        "floor": 0.78,
+        "answered": 42,
+        "answered_with_gold_top5": 33,
+        "coverage": 0.3443,
+        "unanswerable_leaked": 19,
+        "abstention_recall": 0.7564
+      }
+    },
+    "0.03": {
+      "hindi": {
+        "floor": 0.845,
+        "answered": 36,
+        "answered_with_gold_top5": 29,
+        "coverage": 0.2951,
+        "unanswerable_leaked": 10,
+        "abstention_recall": 0.8718
+      },
+      "english": {
+        "floor": 0.78,
+        "answered": 16,
+        "answered_with_gold_top5": 13,
+        "coverage": 0.1311,
+        "unanswerable_leaked": 6,
+        "abstention_recall": 0.9231
+      }
+    }
+  }
+}
