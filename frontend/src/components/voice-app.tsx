@@ -27,28 +27,43 @@ import type { VoiceState } from "@/lib/types";
  * happening, the corner cards hold the transcript and the last few takes, and
  * the rail panels keep the full history for anyone who wants to read it back.
  */
-export function VoiceApp() {
+export function VoiceApp({ conversationId }: { conversationId?: string }) {
   const [handsFree, setHandsFree] = useHandsFree();
-  const { record, answer } = useConversation();
+  const { record, answer, adopt } = useConversation();
 
-  // Log each finished exchange for the History and Conversations panels.
+  // Log each finished exchange for the Conversations panel. The backend has
+  // already filed the same turn under the same id; this is the optimistic
+  // copy, so the thread on screen never waits on a round trip to Neon.
   const remember = useCallback(
     (exchange: Exchange) => {
-      const id = record({
-        text: exchange.question,
-        languageCode: exchange.languageCode,
-      });
+      const id = record(
+        { text: exchange.question, languageCode: exchange.languageCode },
+        exchange.id,
+      );
       if (!id) return;
 
       answer(id, {
         reply: exchange.reply || null,
-        replyStatus: exchange.reply ? "answered" : "abstained",
-        replyReason: exchange.interrupted ? "Interrupted" : null,
+        replyStatus: exchange.interrupted
+          ? "interrupted"
+          : exchange.reply
+            ? "answered"
+            : "abstained",
+        replyReason: null,
         replyMs: exchange.timings?.total ?? null,
       });
     },
     [answer, record],
   );
+
+  /**
+   * The server opened (or reopened) the conversation this take belongs to.
+   *
+   * `adopt` writes `/c/{id}` into the address bar without navigating, so the
+   * socket carrying the reply survives getting an address — a real navigation
+   * here would cut the answer off mid-word.
+   */
+  const remembered = useCallback((id: string) => adopt(id), [adopt]);
 
   const {
     status,
@@ -67,7 +82,12 @@ export function VoiceApp() {
     stop,
     cancel,
     ask,
-  } = useVoiceSession({ handsFree, onExchange: remember });
+  } = useVoiceSession({
+    handsFree,
+    onExchange: remember,
+    conversationId,
+    onConversation: remembered,
+  });
 
   const orbState: VoiceState = speaking
     ? "speaking"

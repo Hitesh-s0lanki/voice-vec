@@ -14,6 +14,22 @@ export type Providers = {
   llmModel: string | null;
   tts: string | null;
   ragEnabled: boolean;
+  /** Highest rung of the effort ladder this deployment will run. */
+  effortMax: number;
+  /**
+   * The answer cache as it actually resolved — `semantic`, `exact-only`,
+   * `unset`, `off`. Not a boolean: the gap between the first two is whether
+   * paraphrases are caught, and a deployment that believes it has semantic
+   * caching and does not will read its hit rate as a tuning problem.
+   */
+  cache: string;
+  /**
+   * Agent memory as it actually resolved — `on`, `unset`, `off`,
+   * `unavailable (…)`. Same vocabulary and the same reason as `cache`: an
+   * agent that has stopped remembering across conversations reads as a model
+   * regression until someone checks whether the service is wired up.
+   */
+  memory: string;
 };
 
 export type VoiceTimings = {
@@ -34,6 +50,7 @@ export type VoiceTimings = {
  */
 export type ActivityStep =
   | "stt"
+  | "memory"
   | "retrieval"
   | "tool"
   | "llm"
@@ -52,6 +69,19 @@ export type ServerEvent =
       languages: Record<string, string>;
     }
   | { type: "status"; stage: VoiceStage; turnId: string | null }
+  | {
+      /**
+       * Which conversation this socket is writing into. Arrives once on
+       * connect when the socket was opened against an existing `conv_…`, and
+       * once with `created` the first time something worth keeping is said —
+       * that second one is the cue to put `/c/{id}` in the address bar.
+       */
+      type: "conversation";
+      id: string;
+      title: string | null;
+      turns: number;
+      created: boolean;
+    }
   | {
       type: "activity";
       turnId: string | null;
@@ -106,9 +136,21 @@ export type ServerEvent =
   | { type: "pong" };
 
 export type ClientEvent =
-  | { type: "audio.start"; mime: string; language?: string | null }
+  /**
+   * `effort` rides on the events that *start a question*, not on the socket
+   * URL, because it is a property of the turn rather than of the connection:
+   * moving the slider has to take effect on the next question, and a query
+   * parameter would need a reconnect to change. Omitted, the server uses its
+   * configured default. See `src/rag/effort.py` for what each rung runs.
+   */
+  | {
+      type: "audio.start";
+      mime: string;
+      language?: string | null;
+      effort?: number;
+    }
   | { type: "audio.end" }
-  | { type: "text"; text: string; language?: string | null }
+  | { type: "text"; text: string; language?: string | null; effort?: number }
   | { type: "cancel" }
   | { type: "reset" }
   | { type: "ping" };
@@ -121,7 +163,8 @@ export type ClientEvent =
  * two-way stream. No key is exposed by doing so — Sarvam and OpenAI are only
  * ever called from the Python side.
  */
-export function voiceSocketUrl(): string {
+/** Where the socket lives, before anything is asked of it. */
+function socketBase(): string {
   const configured = process.env.NEXT_PUBLIC_VOICE_WS_URL;
   if (configured) return configured;
 
@@ -133,9 +176,39 @@ export function voiceSocketUrl(): string {
   return `${protocol}//${window.location.hostname}:8001/voice/ws`;
 }
 
+/**
+ * The socket URL, carrying who is asking and what they are continuing.
+ *
+ * On the query string rather than in a first frame because the server binds
+ * before it says `ready`: the model needs its own history back *before* the
+ * first take, not a round trip after it. A browser cannot set headers on a
+ * WebSocket handshake either, so it is also the only place `token` can ride —
+ * acceptable because a Clerk session token lives about a minute and a fresh
+ * one is fetched per connection.
+ *
+ * There is no `user` here on purpose. The account comes from the token's
+ * verified `sub`, server-side; a user id on a query string is a value anyone
+ * can type.
+ */
+export function voiceSocketUrl(
+  who: { session?: string; token?: string; conversation?: string } = {},
+): string {
+  const base = socketBase();
+  if (!base) return "";
+
+  const url = new URL(base);
+  if (who.session) url.searchParams.set("session", who.session);
+  if (who.token) url.searchParams.set("token", who.token);
+  if (who.conversation) url.searchParams.set("conversation", who.conversation);
+
+  return url.toString();
+}
+
 /** The same backend over plain HTTP — `/voice/config`, `/voice/speak`. */
 export function voiceHttpUrl(path: string): string {
-  const socket = voiceSocketUrl();
+  // The bare base, not `voiceSocketUrl()` — the query string that call adds
+  // would end up in the middle of the path this builds.
+  const socket = socketBase();
   if (!socket) return path;
 
   const base = socket.replace(/^ws/, "http").replace(/\/voice\/ws$/, "");

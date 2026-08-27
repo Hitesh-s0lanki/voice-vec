@@ -5,6 +5,7 @@ import { BookOpen, CircleSlash, ShieldX, TriangleAlert } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 import { PanelChip } from "@/components/panels/panel";
+import { EFFORT_LEVELS } from "@/lib/effort";
 import type { AskResponse, Citation } from "@/lib/rag";
 import { cn } from "@/lib/utils";
 
@@ -66,7 +67,20 @@ export function AnswerCard({ state }: { state: AnswerState }) {
         </span>
 
         <span className="flex items-center gap-1.5">
-          <PanelChip>Tier {response.tier}</PanelChip>
+          {/* The rung asked for, and — only when they differ — the rung that
+              actually answered. A `deep` request answered at tier 1 is a
+              synthesis that fell back to the extractive path, and hiding that
+              behind one number is how a degraded answer reads as a fast one. */}
+          <PanelChip className="capitalize">{response.mode}</PanelChip>
+          {response.cached ? (
+            <PanelChip>cached</PanelChip>
+          ) : (
+            tierName(response.tier) !== response.mode && (
+              <PanelChip className="capitalize">
+                via {tierName(response.tier)}
+              </PanelChip>
+            )
+          )}
           <PanelChip
             className={cn(
               "tabular-nums",
@@ -106,6 +120,11 @@ export function AnswerCard({ state }: { state: AnswerState }) {
   );
 }
 
+/** The rung's name, lowercased to match `response.mode`. */
+function tierName(tier: number): string {
+  return (EFFORT_LEVELS[tier]?.label ?? `level ${tier}`).toLowerCase();
+}
+
 function Searching() {
   return (
     <div className="glass fade flex w-full flex-col gap-2.5 rounded-2xl px-5 py-4">
@@ -129,7 +148,7 @@ function Meter({
       <span className="tabular-nums">{Math.round(confidence * 100)}%</span>
       <span
         aria-hidden
-        className="h-1 flex-1 overflow-hidden rounded-full bg-surface-2"
+        className="glass-track h-1.5 flex-1 overflow-hidden rounded-full"
       >
         <span
           className="block h-full rounded-full bg-ink/35"
@@ -160,7 +179,7 @@ function Sources({
       <button
         type="button"
         onClick={() => setOpen((previous) => !previous)}
-        className="self-start text-[0.7rem] font-medium tracking-wide text-ink-muted transition-colors hover:text-ink-soft"
+        className="glass-row self-start rounded-md px-1.5 py-0.5 text-[0.7rem] font-medium tracking-wide text-ink-muted hover:text-ink-soft"
         aria-expanded={open}
       >
         {open ? "Hide" : "Show"} {answered ? "source" : "closest match"}
@@ -172,7 +191,7 @@ function Sources({
           {citations.map((citation) => (
             <li
               key={citation.docId}
-              className="flex flex-col gap-1 rounded-lg bg-surface-2 px-3 py-2"
+              className="glass-tile flex flex-col gap-1 rounded-lg px-3 py-2"
             >
               <div className="flex items-center gap-1.5 text-[0.66rem] text-ink-muted">
                 <PanelChip>{citation.strategy}</PanelChip>

@@ -18,6 +18,8 @@ import struct
 import time
 from typing import Annotated
 
+import anyio
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -30,6 +32,8 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 
+from src.chat.store import Owner
+from src.core.clerk import get_verifier
 from src.core.config import Settings, get_settings
 from src.schemas import voice as events
 from src.schemas.voice import SpeakRequest, TranscribeResponse
@@ -65,9 +69,42 @@ async def voice_ws(websocket: WebSocket) -> None:
     `ping`; binary frames in between `audio.start` and `audio.end` are the
     recording. Server → client: the events in `src/schemas/voice.py`, with
     binary frames carrying PCM for the segment last announced.
+
+    Three query parameters decide where the conversation is written:
+
+        session       the browser's own `sess_…`, for a visitor with no account
+        token         a Clerk session token; its verified `sub` is the account
+        conversation  a `conv_…` to continue; omitted to start something new
+
+    They are on the URL rather than in a first frame because binding has to
+    happen before `ready` — the model needs its own history back before the
+    first take, not after it. A browser cannot set headers on a WebSocket
+    handshake, so the query string is the only place a token can ride; Clerk's
+    session tokens live about a minute, which is what makes that acceptable
+    rather than merely convenient. The client fetches a fresh one per
+    connection.
+
+    There is deliberately no `user` parameter. An account is only ever a `sub`
+    out of a signature that verified — anything else is a value the caller
+    typed, and this socket is reachable from the open internet the moment the
+    backend is.
     """
     await websocket.accept()
     settings = get_settings()
+    params = websocket.query_params
+
+    # An unverifiable token makes the caller anonymous rather than rejected —
+    # the same rule the REST surface follows, and the reason a signed-in
+    # visitor whose token expired mid-idle still gets a working microphone.
+    # The browser id is trimmed and capped: it reaches an indexed column, and a
+    # query string is whatever the client felt like sending.
+    # Off the event loop: verifying costs nothing once the signing keys are
+    # cached, but the very first token of a process fetches the JWKS over the
+    # network, and this handler is what every other socket is waiting on.
+    owner = Owner(
+        user_id=await anyio.to_thread.run_sync(get_verifier().user_id, params.get("token")),
+        session_id=(params.get("session") or "").strip()[:128] or None,
+    )
 
     # Starlette's send is not safe to call from two tasks at once, and here two
     # do: the turn streams events while the receive loop answers pings.
@@ -92,12 +129,16 @@ async def voice_ws(websocket: WebSocket) -> None:
             except (RuntimeError, WebSocketDisconnect):
                 closed.set()
 
-    session = VoiceSession(emit=emit, send_audio=send_audio, settings=settings)
+    session = VoiceSession(
+        emit=emit, send_audio=send_audio, settings=settings, owner=owner
+    )
     await emit(session.describe())
+    await session.bind(params.get("conversation"))
 
     recording: bytearray | None = None
     mime = "audio/webm"
     language: str | None = None
+    effort: int | None = None
     overflowed = False
 
     try:
@@ -137,6 +178,11 @@ async def voice_ws(websocket: WebSocket) -> None:
                 overflowed = False
                 mime = str(payload.get("mime") or "audio/webm")
                 language = normalise(payload.get("language"))
+                # Read at `audio.start` and used at `audio.end`, because that
+                # is when the take becomes a question. Moving the slider while
+                # the mic is open applies to the *next* take, which is also the
+                # only reading a listener could predict.
+                effort = _effort(payload)
 
             elif kind == "audio.end":
                 take, recording = recording, None
@@ -148,13 +194,21 @@ async def voice_ws(websocket: WebSocket) -> None:
                         )
                     )
                 elif take:
-                    session.start(session.from_audio(bytes(take), mime=mime, language=language))
+                    session.start(
+                        session.from_audio(
+                            bytes(take), mime=mime, language=language, effort=effort
+                        )
+                    )
 
             elif kind == "text":
                 text = str(payload.get("text") or "").strip()
                 if text:
                     session.start(
-                        session.from_text(text, language=normalise(payload.get("language")))
+                        session.from_text(
+                            text,
+                            language=normalise(payload.get("language")),
+                            effort=_effort(payload),
+                        )
                     )
 
             elif kind == "cancel":
@@ -255,6 +309,24 @@ def _wav_header(sample_rate: int, channels: int = 1, bits: int = 16) -> bytes:
         + b"data"
         + struct.pack("<I", 0xFFFFFFFF)
     )
+
+
+def _effort(payload: dict) -> int | None:
+    """The rung this take asked for, or None to use the configured default.
+
+    Whatever the client sent, coerced or discarded — this is a value off an
+    open WebSocket, so a string, a float or a number from a client built
+    against a longer ladder all have to land somewhere sensible. Out-of-range
+    integers are clamped by `Settings.effort_level` rather than here, so the
+    ceiling lives in one place.
+    """
+    raw = payload.get("effort")
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 async def _unused(*_args, **_kwargs) -> None:

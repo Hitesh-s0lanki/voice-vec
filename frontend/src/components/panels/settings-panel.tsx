@@ -49,8 +49,9 @@ export function SettingsPanel() {
             onClick={() => setHandsFree(!handsFree)}
             title="Reopen the microphone as soon as the answer ends"
             className={cn(
-              "relative h-5 w-9 rounded-full border border-line transition-colors",
-              handsFree ? "bg-ink/75" : "bg-surface-2",
+              "relative h-5 w-9 rounded-full border border-line transition-colors hover:border-line-strong",
+              // off is a groove cut into the panel; on fills it with ink
+              handsFree ? "bg-ink/78" : "glass-track",
             )}
           >
             <span
@@ -102,6 +103,19 @@ export function SettingsPanel() {
         <Row label="Retrieval">
           <PanelChip>{providers?.ragEnabled ? "on" : "off"}</PanelChip>
         </Row>
+
+        {/*
+          Not a boolean, because the interesting difference is between the two
+          working states: `semantic` catches a paraphrase of a question already
+          answered, `exact-only` catches only the same words again. A
+          deployment that believes it has the first and has the second will
+          read its hit rate as a tuning problem rather than a missing module.
+        */}
+        <Row label="Answer cache">
+          <PanelChip title="Repeat questions are answered from Redis instead of re-running the pipeline">
+            {providers?.cache ?? "—"}
+          </PanelChip>
+        </Row>
       </dl>
     </>
   );
@@ -115,7 +129,7 @@ function Row({
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex min-h-9 items-center justify-between gap-3 rounded-lg px-2 py-1 transition-colors hover:bg-surface-2">
+    <div className="glass-row flex min-h-9 items-center justify-between gap-3 rounded-lg px-2 py-1">
       <dt className="text-[0.78rem] text-ink-muted">{label}</dt>
       <dd className="flex items-center">{children}</dd>
     </div>

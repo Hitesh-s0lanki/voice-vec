@@ -22,18 +22,44 @@ State per connection is the conversation history and, at most, one running
 turn. Barge-in cancels that turn: the reply stops mid-word, and what was
 already spoken is what goes into the history, because the model must not
 believe it said sentences the listener never heard.
+
+That history is also written down. The first sentence anyone says opens a row
+in `conversations` and the client puts `/c/{id}` in the address bar; every
+question and every reply — including the half-spoken one a barge-in leaves —
+is appended to it. Reloading that URL hands the model its own past back
+(`bind`), so a refresh continues the conversation instead of starting one.
+
+Storage is never in the turn's way. Writes go onto a queue that a separate
+task drains through a worker thread, so a slow Neon round trip cannot delay a
+spoken word, and a dead one costs the listener nothing but the URL.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import partial
 from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable
 
+import anyio
+
+from src.chat.tools import ToolCallStore, get_tool_call_store
+from src.integrations.agent import ToolAgent, get_agent
+from src.chat.store import (
+    ChatStore,
+    Owner,
+    get_chat_store,
+    is_conversation_id,
+    new_conversation_id,
+    title_from,
+)
 from src.core.config import Settings, get_settings
+from src.memory.store import MemoryStore, as_prompt, get_memory
 from src.schemas import voice as events
 from src.voice import llm, stt, tts
 from src.voice.http import ProviderError
@@ -41,7 +67,7 @@ from src.voice.languages import LANGUAGES, display, normalise
 from src.voice.segment import Segmenter
 
 if TYPE_CHECKING:  # the RAG stack is imported lazily — see `_retrieve`
-    from src.schemas.ask import Timings
+    from src.schemas.ask import AskResponse, Timings
 
 log = logging.getLogger("vec.voice")
 
@@ -73,6 +99,26 @@ def _stage_detail(timings: "Timings") -> str | None:
     return " · ".join(f"{name} {ms:.0f} ms" for name, ms in spent[:2])
 
 
+def _retrieval_detail(answer: "AskResponse") -> str | None:
+    """What the rung actually did, then where the time went.
+
+    A cache hit and a four-call adaptive run both come back as "answered", and
+    the difference between them is the entire reason the effort slider exists.
+    Leading with it means the activity feed reports the *shape* of the work and
+    not only its duration.
+    """
+    parts: list[str] = []
+    if answer.cached:
+        parts.append("from cache")
+    elif answer.escalations:
+        parts.append(" + ".join(answer.escalations[:3]))
+
+    stages = _stage_detail(answer.timings)
+    if stages:
+        parts.append(stages)
+    return " · ".join(parts) or None
+
+
 @dataclass(slots=True)
 class _Synth:
     """A segment already being synthesised, with somewhere to put the bytes."""
@@ -96,7 +142,14 @@ class _Turn:
     reply: float | None = None
     spoken: str = ""
     segments: int = 0
+    #: How many tools the agent ran this turn. Reported on `turn.end` so a
+    #: reply that took four seconds has a visible reason.
+    tools: int = 0
     language_code: str | None = None
+    #: The effort rung the client asked for this turn, or None to fall back to
+    #: `Settings.effort_default`. Per-turn, not per-session: the slider can
+    #: move between two sentences of the same conversation.
+    effort: int | None = None
 
     def mark(self) -> float:
         return round((time.perf_counter() - self.started) * 1000, 1)
@@ -126,12 +179,34 @@ class VoiceSession:
     settings: Settings = field(default_factory=get_settings)
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     history: list[llm.Message] = field(default_factory=list)
+    #: Whose conversation this is — an account when there is one, the browser's
+    #: own `sess_…` when there is not. Empty means nothing gets written down.
+    owner: Owner = field(default_factory=Owner)
+    #: The row every turn is appended to. Null until the first real sentence.
+    conversation_id: str | None = None
+    chat: ChatStore = field(default_factory=get_chat_store)
+    #: What the agent may run, and where the record of it goes. Both are
+    #: no-ops for a session whose owner has linked nothing.
+    agent: ToolAgent = field(default_factory=get_agent)
+    tool_calls: ToolCallStore = field(default_factory=get_tool_call_store)
+    #: What the agent remembers from *other* conversations. A no-op for a
+    #: deployment with no Agent Memory service — see `src/memory/store.py`.
+    memory: MemoryStore = field(default_factory=get_memory)
     _turn: asyncio.Task | None = field(default=None, init=False, repr=False)
+    _writes: "asyncio.Queue[Callable[[], object]] | None" = field(
+        default=None, init=False, repr=False
+    )
+    _writer: asyncio.Task | None = field(default=None, init=False, repr=False)
 
     # ---- lifecycle ------------------------------------------------------
 
     def describe(self) -> events.Ready:
         """What this session can actually do, said up front."""
+        # Imported here rather than at module scope for the same reason the
+        # rest of the RAG stack is: a checkout with retrieval off should not
+        # pay for it at import time.
+        from src.rag.cache import get_cache
+
         target = self.settings.resolve_llm()
         speaks = self.settings.sarvam_ready or self.settings.openai_ready
 
@@ -143,6 +218,9 @@ class VoiceSession:
                 llm_model=target.model if target.ready else None,
                 tts=("sarvam" if self.settings.sarvam_ready else "openai") if speaks else None,
                 rag_enabled=self.settings.rag_enabled,
+                effort_max=self.settings.effort_max,
+                cache=get_cache().describe(),
+                memory=self.memory.describe(),
             ),
             sample_rate=self.settings.tts_sample_rate,
             languages=dict(LANGUAGES),
@@ -166,8 +244,15 @@ class VoiceSession:
             self._turn.cancel()
 
     def reset(self) -> None:
+        """Start over. The old conversation stays in Postgres; this one is new.
+
+        Unbinding rather than deleting is what makes `reset` cheap and
+        recoverable: the next take opens a fresh row and the client is told the
+        new id, while everything already said is still at its own `/c/…`.
+        """
         self.cancel()
         self.history.clear()
+        self.conversation_id = None
 
     async def aclose(self) -> None:
         self.cancel()
@@ -176,6 +261,211 @@ class VoiceSession:
                 await self._turn
             except (asyncio.CancelledError, Exception):  # noqa: BLE001 — closing
                 pass
+
+        # The last reply is usually still on the queue here: the socket closes
+        # the moment the tab does, and the turn that ended it finished
+        # milliseconds ago. Give the writer a bounded chance to land it — but
+        # bounded, because a hung database must not hold the connection open.
+        if self._writes is not None and self._writer is not None:
+            try:
+                await asyncio.wait_for(self._writes.join(), timeout=5)
+            except (TimeoutError, asyncio.TimeoutError):
+                log.warning("dropped %d unwritten message(s)", self._writes.qsize())
+
+        if self._writer is not None:
+            self._writer.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._writer
+            self._writer = None
+
+    # ---- the conversation it is written into ----------------------------
+
+    @property
+    def whose(self) -> str | None:
+        """The one id both stores key on — the account, or the browser's own.
+
+        Postgres matches a conversation on *either* column; agent memory has a
+        single `actorId`/`ownerId`, so it has to be told which one this is. The
+        account wins when there is one, which means signing in carries a
+        visitor's memories forward under their `sess_…` id rather than
+        stranding them — the same widening the conversations predicate does.
+        """
+        return self.owner.user_id or self.owner.session_id or None
+
+    @property
+    def persists(self) -> bool:
+        """Whether anything said here can be written down at all.
+
+        Two ways it can be false, and both are ordinary rather than broken: a
+        checkout with no DATABASE_URL, and a client that sent no identity. The
+        voice loop is unchanged in either case — it just leaves no trace.
+        """
+        return self.chat.configured and self.owner.known
+
+    async def bind(self, conversation_id: str | None) -> None:
+        """Pick an existing conversation back up, history and all.
+
+        This is what a reload of `/c/{id}` costs: one indexed read for the row
+        (which also proves it belongs to whoever is asking) and one for the
+        tail of its messages, both before the socket says `ready`. Without it a
+        refresh would leave the model with no idea what it had just been
+        talking about.
+
+        Anything unexpected — a stranger's id, a database that is down — leaves
+        the session unbound rather than failing the connection. The next take
+        then opens a new conversation, which is a far better outcome for
+        someone holding a microphone than a socket that refuses to open.
+        """
+        if not conversation_id or not self.persists or not is_conversation_id(conversation_id):
+            return
+
+        try:
+            found = await anyio.to_thread.run_sync(
+                partial(self.chat.get, conversation_id, self.owner)
+            )
+            if found is None:
+                log.info("conversation %s is not available to this caller", conversation_id)
+                return
+
+            self.history = await anyio.to_thread.run_sync(
+                partial(
+                    self.chat.history,
+                    found.id,
+                    max_messages=self.settings.llm_history_turns * 2,
+                )
+            )
+        except Exception as error:  # unreachable database, bad DSN, …
+            log.warning("could not open conversation %s: %s", conversation_id, error)
+            return
+
+        self.conversation_id = found.id
+        await self.emit(
+            events.ConversationEvent(
+                id=found.id, title=found.title, turns=found.turns, created=False
+            )
+        )
+
+    async def _open(self, turn: _Turn, question: str) -> None:
+        """Open a conversation on the first thing worth keeping.
+
+        The id is minted here rather than read back from the insert, so the
+        client has its URL a round trip earlier — the address bar changes while
+        the model is still writing. The insert is queued *before* any message,
+        and the queue is serial, so the foreign key is satisfied by
+        construction even though nothing waited for it.
+        """
+        if self.conversation_id or not self.persists:
+            return
+
+        conversation_id = new_conversation_id()
+        title = title_from(question)
+        self.conversation_id = conversation_id
+
+        self._enqueue(
+            partial(
+                self.chat.create,
+                self.owner,
+                conversation_id=conversation_id,
+                title=title,
+                language=turn.language_code,
+            )
+        )
+        await self.emit(
+            events.ConversationEvent(id=conversation_id, title=title, created=True)
+        )
+
+    def _enqueue(self, job: Callable[[], object]) -> None:
+        """Hand a blocking write to the writer task. Never awaited by a turn."""
+        if not self.persists:
+            return
+
+        if self._writes is None:
+            self._writes = asyncio.Queue()
+        if self._writer is None or self._writer.done():
+            self._writer = asyncio.create_task(self._drain())
+
+        self._writes.put_nowait(job)
+
+    async def _drain(self) -> None:
+        """Run queued writes one at a time, in the order they were made.
+
+        Serial on purpose. The rows have an order — the conversation before its
+        first message, the question before its answer — and a pool that runs
+        them concurrently would be free to invert it.
+        """
+        assert self._writes is not None
+
+        while True:
+            job = await self._writes.get()
+            try:
+                await anyio.to_thread.run_sync(job)
+            except Exception as error:  # noqa: BLE001 — storage must not surface
+                log.warning("conversation write failed: %s", error)
+            finally:
+                self._writes.task_done()
+
+    def _save(
+        self,
+        turn: _Turn,
+        role: str,
+        text: str,
+        *,
+        status: str | None = None,
+        reason: str | None = None,
+        latency_ms: float | None = None,
+    ) -> None:
+        """Append one message to the open conversation, eventually."""
+        if not self.conversation_id or not text.strip():
+            return
+
+        self._enqueue(
+            partial(
+                self.chat.append,
+                self.conversation_id,
+                role=role,
+                text=text.strip(),
+                turn_id=turn.id,
+                language_code=turn.language_code,
+                status=status,
+                reason=reason,
+                latency_ms=latency_ms,
+            )
+        )
+        self._mirror(role, text, status=status)
+
+    #: Assistant turns worth extracting facts from. A barge-in is included —
+    #: what was heard before the interruption is as true as a whole reply — and
+    #: a provider failure is not, because the text on an errored turn is either
+    #: empty or half a sentence and its only effect downstream would be to
+    #: spend a 30 MB instance on noise.
+    _EXTRACTABLE = frozenset({None, "answered", "interrupted"})
+
+    def _mirror(self, role: str, text: str, *, status: str | None = None) -> None:
+        """Put the same turn into session memory, for the service to distil.
+
+        Rides the writer queue the Postgres append just went on, so the two
+        stores are written in the same order by the same serial task and a slow
+        memory service delays a spoken word exactly as much as a slow database
+        does, which is not at all.
+
+        The gate is `conversation_id`, already checked by the caller: if a turn
+        was not worth a row in Postgres it is not worth an event here either,
+        and that single rule is what keeps coughs, anonymous callers and
+        five-second takes out of an instance this small.
+        """
+        whose = self.whose
+        if not whose or not self.memory.configured or status not in self._EXTRACTABLE:
+            return
+
+        self._enqueue(
+            partial(
+                self.memory.remember,
+                session_id=self.conversation_id,
+                actor_id=whose,
+                role=role,
+                text=text,
+            )
+        )
 
     # ---- the running commentary -----------------------------------------
 
@@ -209,9 +499,16 @@ class VoiceSession:
 
     # ---- turns ----------------------------------------------------------
 
-    async def from_audio(self, audio: bytes, *, mime: str, language: str | None = None) -> None:
+    async def from_audio(
+        self,
+        audio: bytes,
+        *,
+        mime: str,
+        language: str | None = None,
+        effort: int | None = None,
+    ) -> None:
         """The ordinary path: someone spoke."""
-        turn = _Turn(id=str(uuid.uuid4()), started=time.perf_counter())
+        turn = _Turn(id=str(uuid.uuid4()), started=time.perf_counter(), effort=effort)
 
         try:
             await self.emit(events.Status(stage="transcribing", turn_id=turn.id))
@@ -256,9 +553,11 @@ class VoiceSession:
 
         await self._answer(turn, heard.text)
 
-    async def from_text(self, text: str, *, language: str | None = None) -> None:
+    async def from_text(
+        self, text: str, *, language: str | None = None, effort: int | None = None
+    ) -> None:
         """The same turn, typed instead of spoken. Useful without a microphone."""
-        turn = _Turn(id=str(uuid.uuid4()), started=time.perf_counter())
+        turn = _Turn(id=str(uuid.uuid4()), started=time.perf_counter(), effort=effort)
         turn.language_code = normalise(language)
 
         await self._say(turn, "stt", "skipped", "Typed — nothing to transcribe")
@@ -289,15 +588,34 @@ class VoiceSession:
             await self.emit(events.Status(stage="idle", turn_id=turn.id))
             return
 
+        # After the length guard, not before: a take that caught a cough should
+        # not leave a conversation behind for someone to find in the rail.
+        await self._open(turn, question)
+        self._save(turn, "user", question)
+
         try:
             await self.emit(events.Status(stage="thinking", turn_id=turn.id))
-            context = await self._retrieve(question, turn)
+            # Concurrently, because they are independent and both are network
+            # round trips: recall asks a service a region away what it knows
+            # about this listener while retrieval searches the corpus for this
+            # question. Run in sequence they would add; run together the slower
+            # one is the whole cost, and recall is never the slower one.
+            #
+            # `_retrieve` raises into the handler below exactly as it did
+            # before. `_recall` adds no new way for a turn to fail: its lookup
+            # swallows everything, and the only thing left in it that can throw
+            # is the same `_say` every other stage already calls.
+            context, memories = await asyncio.gather(
+                self._retrieve(question, turn),
+                self._recall(question, turn),
+            )
 
             messages = llm.build_messages(
                 transcript=question,
                 history=self.history,
                 language_code=turn.language_code,
                 context=context,
+                memories=memories,
                 max_turns=self.settings.llm_history_turns,
             )
 
@@ -311,20 +629,24 @@ class VoiceSession:
                 ms=turn.mark(),
             )
 
+            # The agent's turn to act, before it has said anything. Runs
+            # only for somebody who has linked a toolkit — see `_use_tools`.
+            messages = await self._use_tools(turn, messages)
+
             voice = tts.choose(turn.language_code, self.settings)
             await self._run(turn, messages, voice)
 
         except ProviderError as error:
-            self._remember(turn, question)
+            self._remember(turn, question, status="error", reason=str(error) or None)
             await self._fail(turn, error, stage="reply")
             return
         except asyncio.CancelledError:
-            self._remember(turn, question)
+            self._remember(turn, question, status="interrupted")
             await self._canceled(turn)
             raise
         except Exception as error:  # a provider changed shape, a socket died…
             log.exception("turn %s failed", turn.id)
-            self._remember(turn, question)
+            self._remember(turn, question, status="error", reason=str(error) or None)
             await self._fail(turn, error, stage="reply")
             return
 
@@ -342,11 +664,174 @@ class VoiceSession:
                 reply=turn.spoken,
                 language_code=turn.language_code,
                 segments=turn.segments,
+                tools=turn.tools,
                 timings=turn.timings(),
             )
         )
         await self._say(turn, "turn", "done", "Turn complete", ms=turn.mark())
         await self.emit(events.Status(stage="idle", turn_id=turn.id))
+
+    async def _use_tools(self, turn: _Turn, messages: list[llm.Message]) -> list[llm.Message]:
+        """Let the model call the user's tools, then hand back what to say.
+
+        The shape is decide → run → decide, bounded by `tool_max_rounds`.
+        Each round is a *buffered* completion, because a tool call cannot be
+        streamed into a synthesiser: the arguments arrive in fragments across
+        many chunks and mean nothing until the last one.
+
+        That buffering is real latency in front of the first spoken word, and
+        it is why the first thing this does is leave. A session whose owner has
+        linked nothing returns the messages it was handed, untouched, having
+        made no network call and added no schema to the prompt — which is every
+        session until somebody opens the Connectors panel.
+
+        Returns the message list to stream from. On any failure that is the
+        original list: an agent that cannot use its tools should still answer.
+        """
+        if not self.settings.tools_enabled or not self.owner.user_id:
+            return messages
+
+        tools = await anyio.to_thread.run_sync(self.agent.tools_for, self.owner.user_id)
+        if not tools:
+            return messages
+
+        working = list(messages)
+        ran = 0
+
+        for round_number in range(self.settings.tool_max_rounds):
+            try:
+                completion = await llm.complete(
+                    working, settings=self.settings, tools=tools
+                )
+            except ProviderError:
+                raise
+            except Exception as error:
+                log.warning("tool round %d failed: %s", round_number, error)
+                # Whatever already ran still counts: its results are in
+                # `working` and throwing them away would run somebody's tools
+                # and then answer as if they had not.
+                return working if ran else messages
+
+            if not completion.wants_tools:
+                # Nothing more to run. Which list to hand on is the whole
+                # correctness question here: with tools already run, `working`
+                # carries their results and the spoken pass must see them —
+                # returning `messages` would execute somebody's tools and then
+                # answer from a prompt that never mentions what they returned.
+                # With nothing run, `messages` is right, because appending this
+                # assistant turn would have the spoken pass reply to itself.
+                return working if ran else messages
+
+            await self._say(
+                turn,
+                "tool",
+                "start",
+                f"Running {len(completion.tool_calls)} tool"
+                f"{'' if len(completion.tool_calls) == 1 else 's'}",
+                detail=", ".join(call.name for call in completion.tool_calls),
+                ms=turn.mark(),
+            )
+
+            # The assistant message carrying the calls has to go back verbatim,
+            # or the `tool` replies below have nothing to attach to.
+            working.append(
+                {
+                    "role": "assistant",
+                    "content": completion.content or None,
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": json.dumps(call.arguments),
+                            },
+                        }
+                        for call in completion.tool_calls
+                    ],
+                }
+            )
+
+            for call in completion.tool_calls:
+                ran += 1
+                result = await self._run_tool(turn, call)
+                working.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": result.for_model(),
+                    }
+                )
+
+        return working
+
+    async def _run_tool(self, turn: _Turn, call: "llm.ToolCall"):
+        """One tool: run it, tell the client, write it down.
+
+        Off the event loop, and with a ceiling on it. A tool that has not
+        answered inside `tool_timeout_s` is costing the listener more than it
+        is worth, so the turn continues and the model is told it timed out —
+        which it can say out loud, unlike a silence.
+        """
+        assert self.owner.user_id is not None
+
+        try:
+            with anyio.fail_after(self.settings.tool_timeout_s):
+                result = await anyio.to_thread.run_sync(
+                    partial(
+                        self.agent.execute,
+                        self.owner.user_id,
+                        call.name,
+                        call.arguments,
+                    )
+                )
+        except TimeoutError:
+            from src.integrations.agent import ToolResult
+
+            result = ToolResult(
+                call.name,
+                ok=False,
+                error="timed out",
+                ms=self.settings.tool_timeout_s * 1000,
+            )
+
+        turn.tools += 1
+        await self._say(
+            turn,
+            "tool",
+            "done" if result.ok else "error",
+            call.name,
+            detail=None if result.ok else (result.error or "failed"),
+            ms=turn.mark(),
+        )
+        self._save_tool(turn, call, result)
+        return result
+
+    def _save_tool(self, turn: _Turn, call: "llm.ToolCall", result) -> None:
+        """Record the call, eventually — on the same queue as the messages.
+
+        The result is measured, not stored: see `src/chat/tools.py` for why an
+        audit table should not become a copy of everything the agent has read.
+        """
+        if not self.tool_calls.configured:
+            return
+
+        rendered = result.for_model() if result.ok else ""
+
+        self._enqueue(
+            partial(
+                self.tool_calls.record,
+                slug=call.name,
+                status="ok" if result.ok else "failed",
+                conversation_id=self.conversation_id,
+                turn_id=turn.id,
+                user_id=self.owner.user_id,
+                arguments=call.arguments,
+                error=None if result.ok else result.error,
+                result_bytes=len(rendered) if rendered else None,
+                latency_ms=result.ms,
+            )
+        )
 
     async def _run(self, turn: _Turn, messages: list[llm.Message], voice: tts.Voice) -> None:
         """Generate, segment, synthesise and send — all at once.
@@ -520,14 +1005,49 @@ class VoiceSession:
 
     # ---- retrieval (off) ------------------------------------------------
 
+    async def _recall(self, question: str, turn: _Turn) -> str | None:
+        """What the agent already knows about whoever is speaking.
+
+        The half of memory that reads. Everything about it is deliberately
+        weaker than retrieval: it is scoped to one owner, capped at a handful
+        of lines, filtered by a similarity floor, bounded by its own timeout
+        and allowed to fail silently — because a fact recalled wrongly is
+        asserted about the listener in the model's opening sentence, where it
+        is both the most damaging thing to get wrong and the least likely to be
+        noticed by anything except a human hearing it.
+
+        Returns `None` when there is nothing to say, never an empty section.
+        """
+        whose = self.whose
+        if not whose or not self.memory.configured:
+            return None
+
+        found = await self.memory.recall(query=question, owner_id=whose)
+        rendered = as_prompt(found)
+
+        if rendered:
+            await self._say(
+                turn,
+                "memory",
+                "done",
+                f"Recalled {len(found)} thing{'' if len(found) == 1 else 's'} from earlier",
+                ms=turn.mark(),
+            )
+        return rendered
+
     async def _retrieve(self, question: str, turn: _Turn) -> str | None:
         """The RAG seam. Returns None while `RAG_ENABLED` is false.
 
         This is the whole switch: with retrieval on, the corpus passages become
         the context the reply is grounded in and the guardrails in
-        `src/rag/guardrails.py` decide whether there is an answer at all. The
-        pipeline underneath it is built and measured (docs/09-v1.md) — it is
-        turned off here, not removed.
+        `src/rag/guardrails.py` decide whether there is an answer at all.
+
+        How hard it works is the turn's own effort level (docs/15-effort.md).
+        Rung 0 hands back passages, rung 1 an extracted span, rungs 2 and up an
+        answer the pipeline already synthesised and checked — and in every case
+        what comes back here is *context for the spoken reply*, not the reply.
+        The voice model still writes what is said, because it is the half that
+        knows the language, the history and how a sentence sounds out loud.
         """
         if not self.settings.rag_enabled:
             await self._say(
@@ -541,26 +1061,37 @@ class VoiceSession:
 
         import anyio
 
+        from src.rag import effort as rungs
         from src.schemas.ask import AskRequest
         from src.services.ask_service import get_ask_service
 
+        level = self.settings.effort_level(turn.effort)
         await self._say(
-            turn, "retrieval", "running", "Searching the corpus", ms=turn.mark()
+            turn,
+            "retrieval",
+            "running",
+            "Searching the corpus",
+            detail=rungs.name(level),
+            ms=turn.mark(),
         )
 
         service = get_ask_service()
+        # Off the event loop, and with the account attached: a user who
+        # connected Pinecone is searched against theirs, everybody else against
+        # the deployment's store (docs/13-connectors.md).
         answer = await anyio.to_thread.run_sync(
-            service.ask,
+            partial(service.ask, user_id=self.owner.user_id),
             AskRequest(
                 transcript=question,
                 language_code=turn.language_code,
+                effort=level,
                 request_id=turn.id,
             ),
         )
 
         # The stage timings the harness produced, said out loud. This is the
-        # inside of the 200 ms budget — the one place a listener can see which
-        # stage spent it.
+        # inside of the budget — the one place a listener can see which stage
+        # spent it, and at which rung.
         await self._say(
             turn,
             "retrieval",
@@ -570,28 +1101,61 @@ class VoiceSession:
                 "abstained": "No source covers this",
                 "refused": "Question turned down at the gate",
             }[answer.status],
-            detail=_stage_detail(answer.timings),
+            detail=_retrieval_detail(answer),
             ms=turn.mark(),
         )
+
+        if "direct" in answer.flags:
+            # Rung 4's router decided this was never a corpus question —
+            # "hello", "say that again". Answer it as a conversation rather
+            # than reading out an abstention about sources.
+            return None
 
         if answer.status != "answered" or not answer.citations:
             # An abstention is a real answer: say so rather than inventing one.
             return f"No source covers this. Tell the user: {answer.reason}"
 
+        if answer.method in {"synthesis", "cache"} and answer.answer:
+            # The upper rungs already wrote a grounded answer and put it past
+            # Gate 4. Handing the passages over again would invite the voice
+            # model to write a second, unchecked one from the same material.
+            return answer.answer
+
         return "\n".join(f"- {citation.text}" for citation in answer.citations[:3])
 
     # ---- bookkeeping ----------------------------------------------------
 
-    def _remember(self, turn: _Turn, question: str) -> None:
+    def _remember(
+        self,
+        turn: _Turn,
+        question: str,
+        *,
+        status: str = "answered",
+        reason: str | None = None,
+    ) -> None:
         """Record the exchange — including a half-spoken one.
 
         After a barge-in the model has to believe it said exactly what was
         heard, no more. Storing the full generated reply would have it
-        referring back to sentences that were cut off mid-word.
+        referring back to sentences that were cut off mid-word. `turn.spoken`
+        is what actually reached the speakers, so both the in-memory history
+        and the row in Postgres get the same honest version.
+
+        Called on every way out of a turn, which is why the status lives here:
+        it is the one place that sees success, barge-in and failure alike.
         """
         self.history.append({"role": "user", "content": question})
         if turn.spoken.strip():
             self.history.append({"role": "assistant", "content": turn.spoken.strip()})
+
+        self._save(
+            turn,
+            "assistant",
+            turn.spoken,
+            status=status,
+            reason=reason,
+            latency_ms=turn.mark(),
+        )
 
         keep = max(2, self.settings.llm_history_turns * 2)
         if len(self.history) > keep:

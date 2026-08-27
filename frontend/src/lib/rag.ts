@@ -14,14 +14,23 @@ export type Citation = {
   isGold: boolean;
 };
 
-/** Per-stage milliseconds. `null` means the stage did not run. */
+/**
+ * Per-stage milliseconds, in pipeline order. `null` means the stage did not
+ * run — which is most of them on most requests, and is the point: the shape of
+ * this block is a readout of which rung ran. A cache hit is `guardIn`,
+ * `embed`, `cache` and nothing else.
+ */
 export type Timings = {
   guardIn: number | null;
   embed: number | null;
+  cache: number | null;
+  route: number | null;
   search: number | null;
   rerank: number | null;
   extract: number | null;
   generate: number | null;
+  grade: number | null;
+  rewrite: number | null;
   guardOut: number | null;
   total: number;
 };
@@ -37,13 +46,28 @@ export type AskResponse = {
   requestId: string;
   language: string | null;
   flags: string[];
+  /** `embedding` / `lexical` (extractive), `passage`, `synthesis`, or `cache`. */
   method: string | null;
+  /** The rung that was *asked for*. `tier` is the one that answered. */
+  mode: string;
+  cached: boolean;
+  /** Which vector store answered — the deployment's, or one the user connected. */
+  backend: string | null;
+  /** What the pipeline did beyond the straight line: `hybrid`, `rewrite`, … */
+  escalations: string[];
+  /**
+   * The deadline this rung is measured against. Rungs 0–1 hold requirement 3's
+   * 200 ms; the upper rungs make network calls and are reported against their
+   * own budget rather than against one they were never going to meet.
+   */
+  budgetMs: number;
   withinBudget: boolean;
 };
 
 export type AskRequest = {
   transcript: string;
   languageCode: string | null;
+  /** The EffortPanel index — a ceiling on escalation, not a floor. */
   effort: number;
   requestId: string;
 };

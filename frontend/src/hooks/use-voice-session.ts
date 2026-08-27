@@ -1,7 +1,10 @@
 "use client";
 
+import { useAuth } from "@clerk/nextjs";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { useEffort } from "@/lib/effort";
+import { browserSessionId } from "@/lib/identity";
 import { PcmPlayer } from "@/lib/pcm-player";
 import {
   voiceSocketUrl,
@@ -84,6 +87,19 @@ type Options = {
   handsFree?: boolean;
   /** Called once per completed take, so a caller can log the turn. */
   onExchange?: (exchange: Exchange) => void;
+  /**
+   * The conversation to continue, from `/c/{id}`. Omitted on a fresh page —
+   * the server opens one on the first take and announces it below.
+   *
+   * Changing it opens a new socket, which is right: it is a different
+   * conversation, with different history behind it.
+   */
+  conversationId?: string;
+  /**
+   * The server bound or opened a conversation for this socket. `created` is
+   * the first take of a new one — the moment the address bar should change.
+   */
+  onConversation?: (id: string, created: boolean) => void;
 };
 
 function pickMimeType(): string | undefined {
@@ -106,7 +122,18 @@ function pickMimeType(): string | undefined {
  * talking, the reply is read aloud while it is still being written, and
  * pressing the orb mid-answer stops the speech instead of queueing behind it.
  */
-export function useVoiceSession({ handsFree = false, onExchange }: Options = {}) {
+export function useVoiceSession({
+  handsFree = false,
+  onExchange,
+  conversationId,
+  onConversation,
+}: Options = {}) {
+  // The socket is opened against FastAPI directly, so signing in has to be
+  // proved to it rather than assumed: `getToken` mints a short-lived Clerk
+  // token per connection, and `userId` in the dependencies below is what
+  // reopens the socket when someone signs in or out mid-session — otherwise
+  // the next conversation would be filed under the browser, not the account.
+  const { getToken, userId } = useAuth();
   const [status, setStatus] = useState<VoiceStatus>("idle");
   const [bars, setBars] = useState<number[]>(IDLE_BARS);
   const [level, setLevel] = useState(0);
@@ -140,13 +167,31 @@ export function useVoiceSession({ handsFree = false, onExchange }: Options = {})
   const tickTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const armingRef = useRef(false);
+  /** A connection whose token is still being fetched — see `connect`. */
+  const openingRef = useRef(false);
   const abandonedRef = useRef(false);
   const attemptsRef = useRef(0);
   const livingRef = useRef(true);
 
   // Read inside callbacks that must not be rebuilt when these change.
+  const tokenRef = useRef(getToken);
+  useEffect(() => {
+    tokenRef.current = getToken;
+  }, [getToken]);
+
+  // The rung to ask for, read at the moment a take starts. Through a ref for
+  // the same reason as everything else here: moving the slider must not rebuild
+  // `start`, which the hands-free effect below holds in its dependencies and
+  // would re-arm the microphone on.
+  const [effort] = useEffort();
+  const effortRef = useRef(effort);
+  useEffect(() => {
+    effortRef.current = effort;
+  }, [effort]);
+
   const handsFreeRef = useRef(handsFree);
   const exchangeRef = useRef(onExchange);
+  const conversationRef = useRef(onConversation);
   const statusRef = useRef<VoiceStatus>("idle");
   useEffect(() => {
     handsFreeRef.current = handsFree;
@@ -154,6 +199,9 @@ export function useVoiceSession({ handsFree = false, onExchange }: Options = {})
   useEffect(() => {
     exchangeRef.current = onExchange;
   }, [onExchange]);
+  useEffect(() => {
+    conversationRef.current = onConversation;
+  }, [onConversation]);
   useEffect(() => {
     statusRef.current = status;
   }, [status]);
@@ -201,7 +249,8 @@ export function useVoiceSession({ handsFree = false, onExchange }: Options = {})
 
     setActivity((previous) =>
       previous.map((row) =>
-        row.turnId === turnId && (row.state === "running" || row.state === "start")
+        row.turnId === turnId &&
+        (row.state === "running" || row.state === "start")
           ? { ...row, state: "skipped" as const }
           : row,
       ),
@@ -210,7 +259,8 @@ export function useVoiceSession({ handsFree = false, onExchange }: Options = {})
 
   const send = useCallback((event: ClientEvent) => {
     const socket = socketRef.current;
-    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(event));
+    if (socket?.readyState === WebSocket.OPEN)
+      socket.send(JSON.stringify(event));
   }, []);
 
   // ---- playback ---------------------------------------------------------
@@ -238,162 +288,217 @@ export function useVoiceSession({ handsFree = false, onExchange }: Options = {})
   // ---- the socket -------------------------------------------------------
 
   const connect = useCallback(() => {
-    if (socketRef.current && socketRef.current.readyState <= WebSocket.OPEN) return;
+    if (openingRef.current) return;
+    if (socketRef.current && socketRef.current.readyState <= WebSocket.OPEN)
+      return;
 
-    const url = voiceSocketUrl();
-    if (!url) return;
+    // Minting the token is asynchronous, which opens a window where no socket
+    // exists yet and a second caller — the retry timer, StrictMode's second
+    // mount — would happily open one too. This flag closes it.
+    openingRef.current = true;
 
-    const socket = new WebSocket(url);
-    socket.binaryType = "arraybuffer";
-    socketRef.current = socket;
+    // Identity goes on the URL, so the server can bind the conversation before
+    // it says `ready`. An empty session id (no storage, insecure origin) is
+    // sent as nothing at all, and the turn simply is not written down.
+    const open = (token: string | null) => {
+      const url = voiceSocketUrl({
+        session: browserSessionId(),
+        conversation: conversationId,
+        token: token ?? undefined,
+      });
+      if (!url) return;
 
-    socket.onopen = () => {
-      attemptsRef.current = 0;
-      setConnected(true);
-      setError(null);
-    };
+      const socket = new WebSocket(url);
+      socket.binaryType = "arraybuffer";
+      socketRef.current = socket;
 
-    socket.onclose = () => {
-      // A socket that has already been replaced — by StrictMode's double
-      // mount, or by a reconnect that beat this event — must not schedule
-      // another. Without this the retries multiply and each new socket is a
-      // *separate conversation* on the server.
-      if (socketRef.current !== socket) return;
+      socket.onopen = () => {
+        attemptsRef.current = 0;
+        setConnected(true);
+        setError(null);
+      };
 
-      setConnected(false);
-      socketRef.current = null;
-      if (!livingRef.current) return;
+      socket.onclose = () => {
+        // A socket that has already been replaced — by StrictMode's double
+        // mount, or by a reconnect that beat this event — must not schedule
+        // another. Without this the retries multiply and each new socket is a
+        // *separate conversation* on the server.
+        if (socketRef.current !== socket) return;
 
-      // Backing off matters: a backend that is down stays down for a while,
-      // and a tight retry loop would spend the whole time reconnecting.
-      const attempt = Math.min(attemptsRef.current++, 5);
-      retryRef.current = setTimeout(
-        () => reconnectRef.current(),
-        Math.min(8_000, 400 * 2 ** attempt),
-      );
-    };
+        setConnected(false);
+        socketRef.current = null;
+        if (!livingRef.current) return;
 
-    socket.onerror = () => {
-      // `onclose` follows and handles the retry; only the message is ours.
-      if (statusRef.current !== "idle") {
-        setError("Lost the connection to the voice service.");
-        setStatus("error");
-      }
-    };
+        // Backing off matters: a backend that is down stays down for a while,
+        // and a tight retry loop would spend the whole time reconnecting.
+        const attempt = Math.min(attemptsRef.current++, 5);
+        retryRef.current = setTimeout(
+          () => reconnectRef.current(),
+          Math.min(8_000, 400 * 2 ** attempt),
+        );
+      };
 
-    socket.onmessage = (message) => {
-      if (message.data instanceof ArrayBuffer) {
-        player().push(message.data);
-        return;
-      }
+      socket.onerror = () => {
+        // `onclose` follows and handles the retry; only the message is ours.
+        if (statusRef.current !== "idle") {
+          setError("Lost the connection to the voice service.");
+          setStatus("error");
+        }
+      };
 
-      let event: ServerEvent;
-      try {
-        event = JSON.parse(message.data as string) as ServerEvent;
-      } catch {
-        return;
-      }
-
-      switch (event.type) {
-        case "ready":
-          setProviders(event.providers);
-          break;
-
-        case "status":
-          if (event.stage === "transcribing") setStatus("transcribing");
-          if (event.stage === "thinking") setStatus("thinking");
-          if (event.stage === "speaking") setStatus("speaking");
-          break;
-
-        case "activity":
-          note({
-            key: `${event.turnId ?? "-"}|${event.step}`,
-            turnId: event.turnId,
-            step: event.step,
-            state: event.state,
-            label: event.label,
-            detail: event.detail,
-            ms: event.ms,
-            at: Date.now(),
-          });
-          break;
-
-        case "transcript":
-          update((previous) => [
-            ...previous,
-            {
-              id: event.turnId,
-              at: Date.now(),
-              question: event.text,
-              languageCode: event.languageCode,
-              language: event.language,
-              reply: "",
-              done: false,
-              interrupted: false,
-              timings: null,
-            },
-          ]);
-          break;
-
-        case "delta":
-          update((previous) =>
-            previous.map((exchange) =>
-              exchange.id === event.turnId
-                ? { ...exchange, reply: exchange.reply + event.text }
-                : exchange,
-            ),
-          );
-          break;
-
-        case "speech.start":
-          if (event.turnId === interruptedRef.current) break;
-          player().open(event.sampleRate);
-          break;
-
-        case "speech.end":
-          player().close();
-          break;
-
-        case "turn.end": {
-          const next = update((previous) =>
-            previous.map((exchange) =>
-              exchange.id === event.turnId
-                ? {
-                    ...exchange,
-                    reply: event.reply.trim(),
-                    done: true,
-                    timings: event.timings,
-                  }
-                : exchange,
-            ),
-          );
-
-          settle(event.turnId);
-
-          const finished = next.find((exchange) => exchange.id === event.turnId);
-          if (finished) exchangeRef.current?.(finished);
-          break;
+      socket.onmessage = (message) => {
+        if (message.data instanceof ArrayBuffer) {
+          player().push(message.data);
+          return;
         }
 
-        case "canceled":
-          settle(event.turnId);
-          update((previous) =>
-            previous.map((exchange) =>
-              exchange.id === event.turnId
-                ? { ...exchange, done: true, interrupted: true }
-                : exchange,
-            ),
-          );
-          setStatus((current) => (current === "speaking" ? current : "idle"));
-          break;
+        let event: ServerEvent;
+        try {
+          event = JSON.parse(message.data as string) as ServerEvent;
+        } catch {
+          return;
+        }
 
-        case "error":
-          setError(event.message);
-          setStatus("error");
-          break;
-      }
+        switch (event.type) {
+          case "ready":
+            setProviders(event.providers);
+            break;
+
+          case "conversation":
+            conversationRef.current?.(event.id, event.created);
+            break;
+
+          case "status":
+            if (event.stage === "transcribing") setStatus("transcribing");
+            if (event.stage === "thinking") setStatus("thinking");
+            if (event.stage === "speaking") setStatus("speaking");
+            break;
+
+          case "activity":
+            note({
+              key: `${event.turnId ?? "-"}|${event.step}`,
+              turnId: event.turnId,
+              step: event.step,
+              state: event.state,
+              label: event.label,
+              detail: event.detail,
+              ms: event.ms,
+              at: Date.now(),
+            });
+            break;
+
+          case "transcript":
+            update((previous) => [
+              ...previous,
+              {
+                id: event.turnId,
+                at: Date.now(),
+                question: event.text,
+                languageCode: event.languageCode,
+                language: event.language,
+                reply: "",
+                done: false,
+                interrupted: false,
+                timings: null,
+              },
+            ]);
+            break;
+
+          case "delta":
+            update((previous) =>
+              previous.map((exchange) =>
+                exchange.id === event.turnId
+                  ? { ...exchange, reply: exchange.reply + event.text }
+                  : exchange,
+              ),
+            );
+            break;
+
+          case "speech.start":
+            if (event.turnId === interruptedRef.current) break;
+            player().open(event.sampleRate);
+            break;
+
+          case "speech.end":
+            player().close();
+            break;
+
+          case "turn.end": {
+            const next = update((previous) =>
+              previous.map((exchange) =>
+                exchange.id === event.turnId
+                  ? {
+                      ...exchange,
+                      reply: event.reply.trim(),
+                      done: true,
+                      timings: event.timings,
+                    }
+                  : exchange,
+              ),
+            );
+
+            settle(event.turnId);
+
+            const finished = next.find(
+              (exchange) => exchange.id === event.turnId,
+            );
+            if (finished) exchangeRef.current?.(finished);
+            break;
+          }
+
+          case "canceled": {
+            settle(event.turnId);
+            const next = update((previous) =>
+              previous.map((exchange) =>
+                exchange.id === event.turnId
+                  ? { ...exchange, done: true, interrupted: true }
+                  : exchange,
+              ),
+            );
+            setStatus((current) => (current === "speaking" ? current : "idle"));
+
+            // A talked-over turn is still a turn, and the backend has already
+            // filed both halves of it. Reporting it here is what keeps the
+            // panels showing the same thread the database holds.
+            const stopped = next.find(
+              (exchange) => exchange.id === event.turnId,
+            );
+            if (stopped?.question) exchangeRef.current?.(stopped);
+            break;
+          }
+
+          case "error":
+            setError(event.message);
+            setStatus("error");
+            break;
+        }
+      };
     };
-  }, [note, player, settle, update]);
+
+    void (async () => {
+      // Signed out, this is null and the turn is filed under the browser.
+      // A failure here is the same outcome: never a reason not to connect.
+      let token: string | null = null;
+      try {
+        token = (await tokenRef.current?.()) ?? null;
+      } catch {
+        token = null;
+      }
+
+      openingRef.current = false;
+      if (!livingRef.current) return;
+      if (socketRef.current && socketRef.current.readyState <= WebSocket.OPEN)
+        return;
+
+      open(token);
+    })();
+    // `userId` is not read in here, and that is the point: it is in the list
+    // so that signing in or out rebuilds `connect` and the effect below
+    // reopens the socket. Without it the server would keep the identity it was
+    // handed at the last handshake, and the next conversation someone started
+    // after signing in would still be filed under the browser.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId, note, player, settle, update, userId]);
 
   useEffect(() => {
     reconnectRef.current = connect;
@@ -450,54 +555,53 @@ export function useVoiceSession({ handsFree = false, onExchange }: Options = {})
    * being listened to — with a floor on speech length, so a cough or the room
    * tone at the very start cannot end a take before it holds anything.
    */
-  const meter = useCallback(
-    (onSilence: () => void) => {
-      const analyser = analyserRef.current;
-      if (!analyser) return;
+  const meter = useCallback((onSilence: () => void) => {
+    const analyser = analyserRef.current;
+    if (!analyser) return;
 
-      const spectrum = new Uint8Array(new ArrayBuffer(analyser.frequencyBinCount));
-      const usable = Math.floor(spectrum.length * 0.55);
-      const band = Math.max(1, Math.floor(usable / BAR_COUNT));
+    const spectrum = new Uint8Array(
+      new ArrayBuffer(analyser.frequencyBinCount),
+    );
+    const usable = Math.floor(spectrum.length * 0.55);
+    const band = Math.max(1, Math.floor(usable / BAR_COUNT));
 
-      const startedAt = performance.now();
-      let quietSince: number | null = null;
-      let spoke = false;
+    const startedAt = performance.now();
+    let quietSince: number | null = null;
+    let spoke = false;
 
-      const tick = () => {
-        analyser.getByteFrequencyData(spectrum);
+    const tick = () => {
+      analyser.getByteFrequencyData(spectrum);
 
-        let peak = 0;
-        const next = Array.from({ length: BAR_COUNT }, (_, i) => {
-          let sum = 0;
-          for (let j = 0; j < band; j++) sum += spectrum[i * band + j] ?? 0;
+      let peak = 0;
+      const next = Array.from({ length: BAR_COUNT }, (_, i) => {
+        let sum = 0;
+        for (let j = 0; j < band; j++) sum += spectrum[i * band + j] ?? 0;
 
-          const shaped = Math.min(1, Math.pow(sum / band / 255, 0.62) * 1.5);
-          peak = Math.max(peak, shaped);
-          return Math.max(0.06, shaped);
-        });
+        const shaped = Math.min(1, Math.pow(sum / band / 255, 0.62) * 1.5);
+        peak = Math.max(peak, shaped);
+        return Math.max(0.06, shaped);
+      });
 
-        setBars(next);
-        setLevel(peak);
+      setBars(next);
+      setLevel(peak);
 
-        const now = performance.now();
-        if (peak > SILENCE_LEVEL) {
-          spoke = true;
-          quietSince = null;
-        } else if (spoke && now - startedAt > MIN_SPEECH_MS) {
-          quietSince ??= now;
-          if (now - quietSince > SILENCE_MS) {
-            onSilence();
-            return;
-          }
+      const now = performance.now();
+      if (peak > SILENCE_LEVEL) {
+        spoke = true;
+        quietSince = null;
+      } else if (spoke && now - startedAt > MIN_SPEECH_MS) {
+        quietSince ??= now;
+        if (now - quietSince > SILENCE_MS) {
+          onSilence();
+          return;
         }
+      }
 
-        frameRef.current = requestAnimationFrame(tick);
-      };
+      frameRef.current = requestAnimationFrame(tick);
+    };
 
-      tick();
-    },
-    [],
-  );
+    tick();
+  }, []);
 
   const start = useCallback(async () => {
     if (armingRef.current || recorderRef.current?.state === "recording") return;
@@ -532,7 +636,11 @@ export function useVoiceSession({ handsFree = false, onExchange }: Options = {})
       stream = await navigator.mediaDevices.getUserMedia({
         // Without cancellation the microphone hears the reply and the next
         // take is the assistant talking to itself.
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
       });
     } catch {
       armingRef.current = false;
@@ -552,11 +660,16 @@ export function useVoiceSession({ handsFree = false, onExchange }: Options = {})
     analyserRef.current = analyser;
 
     const mimeType = pickMimeType();
-    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    const recorder = new MediaRecorder(
+      stream,
+      mimeType ? { mimeType } : undefined,
+    );
     recorderRef.current = recorder;
 
-    const type = (recorder.mimeType || mimeType || "audio/webm").split(";")[0].trim();
-    send({ type: "audio.start", mime: type });
+    const type = (recorder.mimeType || mimeType || "audio/webm")
+      .split(";")[0]
+      .trim();
+    send({ type: "audio.start", mime: type, effort: effortRef.current });
 
     recorder.ondataavailable = async (event) => {
       if (event.data.size === 0 || abandonedRef.current) return;
@@ -586,7 +699,9 @@ export function useVoiceSession({ handsFree = false, onExchange }: Options = {})
 
     const startedAt = performance.now();
     tickTimerRef.current = setInterval(() => {
-      setRemaining(Math.max(0, MAX_RECORDING_MS - (performance.now() - startedAt)));
+      setRemaining(
+        Math.max(0, MAX_RECORDING_MS - (performance.now() - startedAt)),
+      );
     }, 250);
 
     stopTimerRef.current = setTimeout(stop, MAX_RECORDING_MS);
@@ -613,7 +728,7 @@ export function useVoiceSession({ handsFree = false, onExchange }: Options = {})
       playerRef.current?.stop();
       await player().unlock();
       connect();
-      send({ type: "text", text, language });
+      send({ type: "text", text, language, effort: effortRef.current });
       setStatus("thinking");
     },
     [connect, player, send, settle],
