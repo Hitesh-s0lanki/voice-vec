@@ -23,7 +23,7 @@ number in the submission. Nothing else we build will be as cheap to prove.
 Placed at four different points because they catch four different failure modes.
 
 ```
-transcript ─► Gate 1 ─► retrieve ─► Gate 2 ─► answer ─► Gate 3 ─► [Tier 3 only] Gate 4 ─► user
+transcript ─► Gate 1 ─► retrieve ─► Gate 2 ─► answer ─► Gate 3 ─► [rung 2 and up] Gate 4 ─► user
               input                 retrieval          grounding                entailment
 ```
 
@@ -83,18 +83,39 @@ Also enforced here:
   snapshot. Queries about current events, personal data, or anything after the corpus date
   cannot be grounded regardless of retrieval score.
 
-### Gate 4 — entailment (Tier 3 only, post-generation)
+### Gate 4 — support (rung 2 and up, post-generation) ✅ built
 
-Only runs when an LLM generated the answer, so it is outside the 200 ms path.
+Replaces Gate 3 wherever the answer was *written* rather than lifted
+([15-effort.md](15-effort.md)). It only runs on rungs that call a model, so it is outside the
+200 ms path by construction — but the gate itself is local and costs milliseconds, because
+the embedder is already loaded and the context is short.
 
-1. **Citation validity.** Every id in `usedChunkIds` must be one we actually retrieved. A
-   fabricated id is a mechanical hallucination catch with no judge model needed
-   ([05-harness.md](05-harness.md)).
-2. **Claim coverage.** Split the answer into claims, embed each, and require each to exceed a
-   similarity threshold against the cited chunks. Uncovered claim → abstain or strip.
-3. **Numeric fidelity.** Every number in the answer must appear in the cited context. Cheap
-   regex, catches the most damaging and most common class of LLM error in a retrieval
-   setting.
+Gate 3 and Gate 4 check the same property by different means, and the difference is the whole
+reason rung 1's hallucination rate is *structurally* zero rather than merely low. An extracted
+span is a substring of its passage; anything else is a bug in the extractor. Generated prose
+can be perfectly faithful without sharing a character sequence with its source, so Gate 4 asks
+the weaker question it can actually answer.
+
+1. **Citation validity.** No citations, no answer — the same rule Gate 3 enforces.
+2. **Claim coverage.** Every *sentence* of the answer is embedded and scored against the
+   sentences of the context it was written from, and enough of them must clear
+   `GENERATION_SUPPORT_FLOOR` (`GENERATION_SUPPORT_RATIO` sets how many). Per sentence rather
+   than per answer, because the failure this catches is local: a model handed four good
+   passages writes three faithful sentences and one fluent invention, and a similarity score
+   over the whole paragraph averages that invention away.
+3. **A gate that cannot run passes.** If the embedding call itself fails, Gate 4 returns no
+   objection and says so in the trace. Refusing because the *check* broke would trade a
+   possible hallucination for a certain abstention on every request while the embedder is
+   unwell.
+
+Not yet built, and worth adding: **numeric fidelity** — every number in the answer must appear
+in the cited context. A cheap regex that catches the most damaging and most common class of
+LLM error in a retrieval setting, and one that sentence-level cosine similarity is
+specifically bad at, because changing a digit barely moves the vector.
+
+The floor is a conservative guess and is flagged as such in
+[15-effort.md](15-effort.md#what-has-not-been-measured): it should be swept against gold
+answers the way Gate 2's was, so the hallucination rate is measured rather than asserted.
 
 ## Abstention is a first-class outcome
 

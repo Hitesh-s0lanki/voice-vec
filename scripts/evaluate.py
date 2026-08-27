@@ -37,6 +37,8 @@ from scripts.ingest import DEFAULT_CACHE, HF_URL, read_rows
 from src.core.config import get_settings
 from src.rag.chunk import normalise
 from src.rag.embed import get_embedder
+from src.rag.backends.resolve import FixedResolver
+from src.rag.cache import AnswerCache
 from src.rag.store import get_store
 from src.schemas.ask import AskRequest
 from src.services.ask_service import AskService
@@ -54,7 +56,17 @@ def evaluate(rows, n: int, seed: int) -> dict:
 
     sample = random.Random(seed).sample(rows, min(n, len(rows)))
 
-    service = AskService(settings, embedder, store, MetricsService(settings))
+    # The cache is switched off for the sweep, deliberately. The sample is
+    # drawn with replacement across grid points and the same query is asked
+    # more than once; a cache would serve the second ask from the first and
+    # every latency figure after it would be a measurement of Redis.
+    service = AskService(
+        settings,
+        embedder,
+        FixedResolver(store),
+        MetricsService(settings),
+        AnswerCache(settings.model_copy(update={"cache_enabled": False})),
+    )
 
     measurements: list[dict] = []
 

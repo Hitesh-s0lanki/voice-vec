@@ -46,7 +46,16 @@ class MetricsService:
             "at": time.time(),
             "status": response.status,
             "tier": response.tier,
+            # The rung asked for, beside the rung that answered. Aggregating on
+            # `tier` alone hides the whole point of the ladder: a `mode: deep`
+            # request answered at `tier: 1` is a synthesis that fell back, and
+            # a run of them is the signal that the model key is wrong.
+            "mode": response.mode,
+            "cached": response.cached,
+            "escalations": response.escalations,
+            "backend": response.backend,
             "confidence": response.confidence,
+            "budget_ms": response.budget_ms,
             "within_budget": response.within_budget,
             "timings": response.timings.model_dump(),
             "trace": trace,
@@ -66,6 +75,17 @@ class MetricsService:
             "deadline_ms": self._settings.deadline_ms,
             "within_budget": sum(1 for r in records if r["within_budget"]),
             "by_status": _counts(r["status"] for r in records),
+            "by_mode": _counts(r.get("mode", "grounded") for r in records),
+            # Cache hits are the one number that makes the upper rungs
+            # affordable, and it is invisible in the latency percentiles
+            # because a hit *is* the fast path being fast.
+            "cached": sum(1 for r in records if r.get("cached")),
+            "modes": {
+                mode: _distribution(
+                    [r["timings"]["total"] for r in records if r.get("mode") == mode]
+                )
+                for mode in sorted({r.get("mode", "grounded") for r in records})
+            },
             "stages": {
                 stage: _distribution(
                     [

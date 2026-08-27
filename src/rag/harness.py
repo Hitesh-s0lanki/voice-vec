@@ -23,14 +23,25 @@ from typing import Any, Callable, TypeVar
 
 T = TypeVar("T")
 
-# Stage names double as the keys of AskResponse.timings.
+# Stage names double as the keys of AskResponse.timings, and the order here is
+# the order they run in — which is what makes the timing block readable as a
+# pipeline rather than as a bag of numbers.
+#
+# `embed` precedes `cache` because the semantic half of the cache is a nearest
+# neighbour search over past query vectors, so the embedding it needs is the
+# same one retrieval would have used. On a cache hit that embedding is the only
+# work the whole request does.
 STAGE_NAMES = (
     "guard_in",
     "embed",
+    "cache",
+    "route",
     "search",
     "rerank",
     "extract",
     "generate",
+    "grade",
+    "rewrite",
     "guard_out",
 )
 

@@ -1,10 +1,21 @@
 """The gates — knowing when not to answer (docs/06-guardrails.md).
 
-Three of the four gates run in v1. Gate 4 (entailment) only applies to
-LLM-generated answers, which arrive with Tier 3.
+All four gates run. Gates 1–3 are on every path; Gate 4 replaces Gate 3 from
+rung 2 up, where the answer is generated rather than lifted.
 
-    transcript ─► Gate 1 ─► retrieve ─► Gate 2 ─► extract ─► Gate 3 ─► user
-                  input                 retrieval            grounding
+    transcript ─► Gate 1 ─► retrieve ─► Gate 2 ─► extract  ─► Gate 3 ─► user
+                  input                 retrieval  synthesis   Gate 4
+
+Gate 3 and Gate 4 check the same property by different means, because the
+answer is a different kind of object. An extracted span is verified *by
+construction* — it is a substring of the passage, and anything else is a bug in
+the extractor. Generated text can be perfectly faithful without sharing a
+single sequence of characters with its source, so Gate 4 asks the weaker
+question it can actually answer: is every sentence of this answer close, in the
+embedding space, to something that was in the context?
+
+That is a real check and a weaker one, and the difference is why rung 1 is the
+tier whose hallucination rate is structurally zero rather than merely low.
 
 Gate 2 is the one that does the real work, because it is the one the labelled
 data scores: ~39% of MSMARCO-XI rows have no gold passage, so abstention
@@ -228,5 +239,77 @@ def gate_grounding(answer: str, context: str, citations: list) -> str | None:
 
     if not citations:
         return "I found an answer but couldn't cite where it came from."
+
+    return None
+
+
+def gate_generation(
+    answer: str,
+    contexts: list[str],
+    citations: list,
+    *,
+    embedder: Embedder,
+    settings: Settings,
+) -> str | None:
+    """Gate 4 — is a generated answer supported by what was retrieved?
+
+    Every sentence of the answer is scored against every sentence of the
+    context, and a sentence is supported when its best match clears
+    `generation_support_floor`. The answer passes when enough of its sentences
+    are supported (`generation_support_ratio`).
+
+    Per sentence rather than whole-answer, because the failure this exists to
+    catch is local: a model handed four good passages writes three faithful
+    sentences and one fluent invention, and a similarity score over the whole
+    paragraph averages that invention away. Per sentence, it is the one that
+    fails.
+
+    Local, so it costs milliseconds and not a round trip — the embedder is
+    already loaded and the context is short. A model-based entailment check
+    would be better and would mean asking an LLM to mark its own homework at
+    the cost of another call on a rung that already made several.
+
+    Returns None when the answer stands, or the user-facing reason to abstain.
+    """
+    if not answer.strip():
+        return "I couldn't get a clear answer out of what I found."
+
+    if not citations:
+        return "I found an answer but couldn't cite where it came from."
+
+    claims = [span.text for span in split_sentences(answer)] or [answer]
+    evidence: list[str] = []
+    for context in contexts:
+        spans = split_sentences(context)
+        if spans:
+            evidence.extend(span.text for span in spans)
+        elif context.strip():
+            evidence.append(context)
+
+    if not evidence:
+        return "I couldn't verify that answer against my sources."
+
+    # One batch, not two. Cheaper, and it removes a whole class of failure:
+    # two calls can only be compared if they landed in the same space, and
+    # nothing in the signature guarantees that.
+    both = [*claims, *evidence]
+    try:
+        vectors = np.asarray(embedder.embed_passages(both, batch_size=len(both)))
+    except Exception:
+        # The gate could not run. Refusing to answer because the *check*
+        # failed would trade a possible hallucination for a certain
+        # abstention on every request while the embedder is unwell — so this
+        # falls through to the weaker guarantee the pipeline still has (the
+        # synthesis prompt and the citations) and says so in the trace, rather
+        # than either passing silently or failing everything.
+        return None
+
+    # Both halves are L2-normalised, so the matrix product is cosine.
+    claim_vectors, evidence_vectors = vectors[: len(claims)], vectors[len(claims) :]
+    support = (claim_vectors @ evidence_vectors.T).max(axis=1)
+    supported = int((support >= settings.generation_support_floor).sum())
+
+    if supported / len(claims) < settings.generation_support_ratio:
+        return "I couldn't verify that answer against my sources."
 
     return None
