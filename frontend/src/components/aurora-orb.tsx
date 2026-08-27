@@ -123,7 +123,16 @@ export function AuroraOrb({
               ? "Interrupt and speak"
               : "Start listening"
         }
-        className="group absolute inset-[7%] grid cursor-pointer place-items-center rounded-full border border-line shadow-sm outline-none transition-transform duration-300 hover:scale-[1.03] focus-visible:ring-2 focus-visible:ring-ink/30 focus-visible:ring-offset-4 focus-visible:ring-offset-shell active:scale-[0.97] disabled:cursor-wait disabled:hover:scale-100"
+        /*
+          `.glass-lens` rather than `.glass`: same surface, no blur. See the
+          note on it in globals.css — this disc is scaled off the analyser
+          every frame while anything is making sound.
+
+          It also keeps `hover:scale` as the hover gesture rather than taking
+          `.glass-hover`, whose lift is a `transform` and would silently win
+          over the scale from the same unlayered block.
+        */
+        className="glass-lens group absolute inset-[7%] grid cursor-pointer place-items-center rounded-full outline-none transition-transform duration-300 hover:scale-[1.03] focus-visible:ring-2 focus-visible:ring-ink/30 focus-visible:ring-offset-4 focus-visible:ring-offset-shell active:scale-[0.97] disabled:cursor-wait disabled:hover:scale-100"
       >
         <span
           aria-hidden

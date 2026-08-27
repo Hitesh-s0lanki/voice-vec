@@ -1,5 +1,6 @@
 "use client";
 
+import { Show, UserButton } from "@clerk/nextjs";
 import { Blocks, Gauge, History, MessagesSquare, Settings } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { ReactNode } from "react";
@@ -47,8 +48,8 @@ const items: RailItem[] = [
     width: "w-88",
   },
   {
-    id: "integration",
-    label: "Integration",
+    id: "connectors",
+    label: "Connectors",
     icon: Blocks,
     panel: <IntegrationPanel />,
     width: "w-80",
@@ -76,7 +77,7 @@ const items: RailItem[] = [
 export function AppSidebar() {
   return (
     // `fixed` doubles as the containing block the panel anchors below measure against
-    <div className="glass fixed right-5 bottom-5 z-50 rounded-2xl p-1.5">
+    <div className="glass fixed right-5 bottom-5 z-50 flex items-center gap-1.5 rounded-2xl p-1.5">
       {/* not a <nav> any more — none of these change the page */}
       <ul aria-label="Panels" className="flex flex-row items-center gap-1.5">
         {items.map(({ id, label, icon: Icon, panel, width }) => (
@@ -95,7 +96,14 @@ export function AppSidebar() {
                       type="button"
                       variant="ghost"
                       size="icon-lg"
-                      className="relative rounded-xl text-ink-muted hover:bg-surface-2 hover:text-ink data-[state=open]:bg-surface-2 data-[state=open]:text-ink"
+                      /*
+                        No hover or open utilities here: the ghost variant
+                        carries `.glass-row`, which already reads the
+                        `data-state` Radix writes onto this button. Adding
+                        `data-[state=open]:bg-*` would be dead weight — the
+                        glass classes are unlayered and outrank utilities.
+                      */
+                      className="relative rounded-xl text-ink-muted hover:text-ink"
                     >
                       <Icon className="size-[1.15rem]" aria-hidden />
                       <span className="sr-only">{label}</span>
@@ -141,7 +149,7 @@ export function AppSidebar() {
                 sideOffset={12}
                 collisionPadding={20}
                 aria-label={label}
-                className={`glass-panel max-h-[min(28rem,calc(100dvh-7rem))] gap-2 overflow-hidden rounded-2xl p-2 text-ink ring-0 ${width}`}
+                className={`max-h-[min(28rem,calc(100dvh-7rem))] gap-2 overflow-hidden rounded-2xl p-2 text-ink ${width}`}
               >
                 {panel}
               </PopoverContent>
@@ -149,6 +157,25 @@ export function AppSidebar() {
           </li>
         ))}
       </ul>
+
+      {/*
+        The account, kept out of the <ul> on purpose: it is the one thing in
+        the rail that opens something other than a panel, and the list is
+        labelled for panels. The rule marks that break rather than letting the
+        avatar read as a sixth icon.
+
+        Sized to the same 36px box as the icon buttons so the row keeps one
+        baseline — the avatar itself is smaller, the way an avatar should be.
+      */}
+      <Show when="signed-in">
+        <span aria-hidden className="h-6 w-px shrink-0 bg-line" />
+        <div className="glass-row flex size-9 shrink-0 items-center justify-center rounded-xl">
+          <UserButton
+            appearance={{ elements: { avatarBox: "size-7" } }}
+            userProfileMode="modal"
+          />
+        </div>
+      </Show>
     </div>
   );
 }

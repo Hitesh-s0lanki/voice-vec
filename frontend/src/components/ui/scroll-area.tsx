@@ -18,7 +18,12 @@ function ScrollArea({
     >
       <ScrollAreaPrimitive.Viewport
         data-slot="scroll-area-viewport"
-        className="size-full rounded-[inherit] transition-[color,box-shadow] outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-1"
+        // `max-h-[inherit]` is what makes a `max-h-*` on the Root actually
+        // scroll. The viewport's `h-full` can't resolve against a parent whose
+        // height is auto-with-a-max-cap, so it grows to the full content height
+        // and Radix sees no overflow — no scrollbar, and scrollTop pinned at 0.
+        // Inheriting the cap moves it onto the element that does the scrolling.
+        className="size-full max-h-[inherit] rounded-[inherit] transition-[color,box-shadow] outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-1"
       >
         {children}
       </ScrollAreaPrimitive.Viewport>
@@ -46,7 +51,7 @@ function ScrollBar({
     >
       <ScrollAreaPrimitive.ScrollAreaThumb
         data-slot="scroll-area-thumb"
-        className="relative flex-1 rounded-full bg-border"
+        className="relative flex-1 rounded-full bg-ink/18 transition-colors hover:bg-ink/30"
       />
     </ScrollAreaPrimitive.ScrollAreaScrollbar>
   )

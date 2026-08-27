@@ -262,6 +262,9 @@ function StatusPill({
           type="button"
           onClick={onHandsFree}
           aria-pressed={handsFree}
+          /* `.glass-hover` reads the `aria-pressed` below — hands-free being
+             on is a state the pill is left in, not just one it passes through
+             under the cursor. */
           className="glass glass-hover fade flex h-8 items-center gap-2 rounded-full px-3.5 text-[0.78rem] font-medium tracking-wide text-ink-muted"
           title="Reopen the microphone as soon as the answer ends"
         >
@@ -292,7 +295,7 @@ function ErrorCard({
       role="alert"
       className="glass glass-danger rise flex w-full max-w-md flex-col items-center gap-3 rounded-2xl px-6 py-5 text-center"
     >
-      <span className="grid size-9 place-items-center rounded-full bg-ink/8 text-ink">
+      <span className="glass-tile grid size-9 place-items-center rounded-full text-ink">
         <TriangleAlert aria-hidden className="size-4.5" />
       </span>
       <p className="text-[0.9rem] leading-relaxed text-ink-soft">{message}</p>
@@ -301,7 +304,7 @@ function ErrorCard({
         variant="ghost"
         size="sm"
         onClick={onRetry}
-        className="glass-hover rounded-full text-ink-muted"
+        className="rounded-full text-ink-muted"
       >
         <RotateCcw aria-hidden />
         Try again
