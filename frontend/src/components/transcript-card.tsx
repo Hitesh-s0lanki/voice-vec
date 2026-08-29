@@ -6,7 +6,6 @@ import { Check, Copy, Radio, Square } from "lucide-react";
 import { PanelChip, PanelHeading, PanelRule } from "@/components/panels/panel";
 import { Button } from "@/components/ui/button";
 import type { Exchange, VoiceStatus } from "@/hooks/use-voice-session";
-import { cn } from "@/lib/utils";
 
 /** What the heading says while a take is still on its way to being text. */
 const HINT: Partial<Record<VoiceStatus, string>> = {
@@ -67,8 +66,9 @@ export function TranscriptCard({
    * it is empty. It appears when a take starts and stays afterwards holding
    * the last thing heard, which is the only state worth a card at all.
    *
-   * It costs the layout nothing to come and go: from `md` up it is `fixed`,
-   * and below that the row it lands in has its height reserved either way.
+   * It costs the layout nothing to come and go: from `lg` up the stack it
+   * sits in is `fixed`, and below that the row it lands in has its height
+   * reserved either way.
    */
   const live = status !== "idle" && status !== "error";
   if (!heard && !live) return null;
@@ -77,18 +77,14 @@ export function TranscriptCard({
     <aside
       aria-label="Transcript"
       /*
-       * From `md` up this is a corner card, anchored by its `bottom` edge so a
-       * long take only ever grows upward into empty space — out of flow, so it
-       * cannot touch the orb. Below `md` there is no spare corner to put it
-       * in: it drops back into the centre column and behaves like any other
-       * card in the stack.
+       * The last card in the bottom-left stack, and the one anchored to the
+       * floor: from `lg` up that stack is `fixed` to the corner, so anything
+       * above this — the tool calls — grows upward into empty space while the
+       * transcript itself never moves. Below `lg` the stack is back in the
+       * centre column and this behaves like any other card in it. The corner
+       * geometry belongs to the stack, not here; see `voice-app.tsx`.
        */
-      className={cn(
-        "glass card-edge rise relative flex w-full flex-col gap-2 rounded-2xl p-2",
-        // `md:bottom-16` clears the centred footer line, which is still wide
-        // enough to reach this corner until the viewport passes `lg`.
-        "md:fixed md:bottom-16 md:left-5 md:z-40 md:w-80 lg:bottom-5",
-      )}
+      className="glass card-edge rise relative flex w-full flex-col gap-2 rounded-2xl p-2"
     >
       <PanelHeading title="Transcript">
         {heard && (
@@ -121,7 +117,7 @@ export function TranscriptCard({
       */}
       <div
         aria-live="polite"
-        className="max-h-[38vh] overflow-y-auto px-2 pt-0.5 pb-1.5 scrollbar-thin"
+        className="max-h-[30dvh] overflow-y-auto px-2 pt-0.5 pb-1.5 scrollbar-thin lg:max-h-[38dvh]"
       >
         {listening ? (
           <p className="flex items-center gap-2 text-[0.78rem] leading-relaxed text-ink-soft">

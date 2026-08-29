@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { Check, MessagesSquare, Wrench, X } from "lucide-react";
+import { Check, ChevronDown, MessagesSquare, Wrench, X } from "lucide-react";
 
 import {
   PanelChip,
@@ -14,6 +14,16 @@ import { useConversation, type Turn } from "@/lib/conversation";
 import type { ToolCall } from "@/lib/conversations";
 import { languageName } from "@/lib/languages";
 import { relativeTime } from "@/lib/time";
+
+/**
+ * Radix lays the viewport's content out as a `display: table`, which sizes to
+ * its widest child — and a tool call's result is a `pre` that does not wrap.
+ * Left alone, one long JSON line stretches the whole thread to its width and
+ * every bubble in it goes along. Forcing that wrapper to `block` puts the
+ * panel's own width back in charge, so the overflow lands where it belongs:
+ * inside the one box holding the JSON.
+ */
+const BLOCK_VIEWPORT = "[&_[data-slot=scroll-area-viewport]>div]:!block";
 
 /**
  * The threaded read: what was heard, and what came back. Turns run oldest to
@@ -52,7 +62,18 @@ export function ConversationsPanel() {
           No exchanges yet. Speak once and the thread starts here.
         </PanelEmpty>
       ) : (
-        <ScrollArea ref={scrollRef} className="max-h-80">
+        /*
+          Tied to the window rather than fixed, and kept a clear `7rem` inside
+          the popover's own ceiling — the difference covers the heading, the
+          rule and the padding, so the panel stops growing before it can be
+          clipped by the box around it. Not `flex-1`: the popover is sized by
+          its content, and a `basis-0` scroll container in an auto-height
+          column collapses to nothing.
+        */
+        <ScrollArea
+          ref={scrollRef}
+          className={`max-h-[min(32rem,calc(100dvh-14rem))] ${BLOCK_VIEWPORT}`}
+        >
           <div className="flex flex-col gap-4 py-1 pr-2">
             {turns.map((turn) => {
               const language = languageName(turn.languageCode);
@@ -130,50 +151,175 @@ function Bubble({
 }
 
 /**
- * What the agent actually ran, under the turn that caused it.
+ * What the agent actually ran, under the turn that caused it — openable, so
+ * the call can be read the way an API call is read: what went in, what came
+ * back, how long it took.
  *
  * The one part of a conversation with an effect outside this app: a message
  * can be re-read, an email is sent. So it is shown rather than left to be
  * inferred from a reply that mentions it — and shown even when it failed,
  * because "it tried and could not" is the thing worth knowing.
  *
- * No results. The backend keeps a result's size and never its content, so
- * there is nothing here that could put somebody's inbox on screen.
+ * Closed by default. A thread is a conversation first; the arguments and the
+ * returned page are the audit read, and they are one click away rather than
+ * between every question and its answer.
  */
 function Tools({ calls }: { calls: ToolCall[] }) {
   if (calls.length === 0) return null;
 
   return (
-    <ul className="flex flex-col gap-1 self-start">
+    <ul className="flex w-full flex-col gap-1 self-start">
       {calls.map((call) => (
-        <li
-          key={call.id}
-          className="glass-dashed flex items-center gap-2 rounded-lg px-2.5 py-1.5"
-        >
-          <Wrench aria-hidden className="size-3 shrink-0 text-ink-muted" />
-          <span className="font-mono text-[0.66rem] text-ink-soft">{call.slug}</span>
-
-          {call.latencyMs !== null && (
-            <span className="text-[0.62rem] tabular-nums text-ink-muted">
-              {Math.round(call.latencyMs)} ms
-            </span>
-          )}
-
-          <span
-            className="ml-auto flex shrink-0 items-center gap-1 text-[0.62rem] text-ink-muted"
-            title={call.error ?? undefined}
-          >
-            {call.ok ? (
-              <Check aria-hidden className="size-2.5" />
-            ) : (
-              <X aria-hidden className="size-2.5 text-destructive" />
-            )}
-            {call.ok ? "ran" : (call.error ?? "failed")}
-          </span>
+        <li key={call.id}>
+          <Tool call={call} />
         </li>
       ))}
     </ul>
   );
+}
+
+function Tool({ call }: { call: ToolCall }) {
+  return (
+    <details className="glass-dashed group rounded-lg">
+      <summary className="flex cursor-pointer list-none items-center gap-2 rounded-lg px-2.5 py-1.5 [&::-webkit-details-marker]:hidden">
+        <Wrench aria-hidden className="size-3 shrink-0 text-ink-muted" />
+        <span className="font-mono text-[0.66rem] text-ink-soft">{call.slug}</span>
+
+        {call.latencyMs !== null && (
+          <span className="shrink-0 text-[0.62rem] whitespace-nowrap tabular-nums text-ink-muted">
+            {Math.round(call.latencyMs)} ms
+          </span>
+        )}
+
+        {/* The failure reason is the provider's own string and can be long;
+            it truncates here and stays whole in the title and in the box
+            below, rather than folding the row onto two lines. */}
+        <span
+          className="ml-auto flex min-w-0 items-center gap-1 text-[0.62rem] text-ink-muted"
+          title={call.error ?? undefined}
+        >
+          {call.ok ? (
+            <Check aria-hidden className="size-2.5 shrink-0" />
+          ) : (
+            <X aria-hidden className="size-2.5 shrink-0 text-destructive" />
+          )}
+          <span className="truncate">
+            {call.ok ? "ran" : (call.error ?? "failed")}
+          </span>
+        </span>
+
+        <ChevronDown
+          aria-hidden
+          className="size-3 shrink-0 text-ink-muted transition-transform group-open:rotate-180"
+        />
+      </summary>
+
+      <div className="flex flex-col gap-2 px-2.5 pb-2.5 pt-0.5">
+        <Field label="Input" empty="Called with no arguments.">
+          {pretty(call.arguments)}
+        </Field>
+
+        {call.ok ? (
+          <Field
+            label="Output"
+            note={size(call.resultBytes, call.result)}
+            empty="The tool returned nothing."
+          >
+            {readable(call.result)}
+          </Field>
+        ) : (
+          <Field label="Error" empty="It failed without saying why.">
+            {call.error}
+          </Field>
+        )}
+      </div>
+    </details>
+  );
+}
+
+/**
+ * One half of a call. Recessed rather than raised — this is content that came
+ * from somewhere else, and `.glass-field` is the surface that goes *in*.
+ *
+ * Wraps rather than scrolling sideways, and caps its height. A stored result
+ * is one long JSON line — 24,000px of it, measured — and in a 300px rail a
+ * horizontal scrollbar is a worse way to read that than a wrapped block with a
+ * vertical one. Indentation survives, because `pre-wrap` keeps the newlines.
+ */
+function Field({
+  label,
+  note,
+  empty,
+  children,
+}: {
+  label: string;
+  note?: string | null;
+  empty?: string;
+  children: string | null;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-baseline gap-2">
+        <p className="text-[0.62rem] font-medium tracking-wide text-ink-muted uppercase">
+          {label}
+        </p>
+        {note && (
+          <span className="text-[0.6rem] tabular-nums text-ink-muted">{note}</span>
+        )}
+      </div>
+
+      {children ? (
+        <pre className="glass-field max-h-64 overflow-y-auto rounded-md px-2 py-1.5 font-mono text-[0.64rem] leading-relaxed break-words whitespace-pre-wrap text-ink-soft">
+          {children}
+        </pre>
+      ) : (
+        <p className="text-[0.66rem] text-ink-muted">{empty ?? "Nothing."}</p>
+      )}
+    </div>
+  );
+}
+
+/** Arguments as the agent sent them. `{}` is a real answer — it called with none. */
+function pretty(value: Record<string, unknown>): string | null {
+  if (!value || Object.keys(value).length === 0) return null;
+
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * The stored preview, indented if it parses.
+ *
+ * It usually will — tool results are rendered as JSON before they are stored —
+ * but a truncated one has "… (truncated)" hung off the end and cannot parse.
+ * That case falls through to the raw text, which is the point of keeping the
+ * marker: a cut result still reads as a cut result rather than as an error.
+ */
+function readable(result: string | null): string | null {
+  const text = result?.trim();
+  if (!text) return null;
+
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2);
+  } catch {
+    return text;
+  }
+}
+
+/**
+ * How much of the result is on screen. `resultBytes` is the size of the whole
+ * of it, so a preview shorter than that says so — otherwise a truncated inbox
+ * page reads as the entire inbox.
+ */
+function size(bytes: number | null, result: string | null): string | null {
+  if (bytes === null || bytes <= 0) return null;
+
+  const whole = bytes < 1024 ? `${bytes} chars` : `${(bytes / 1024).toFixed(1)}k chars`;
+  const shown = result?.length ?? 0;
+  return shown > 0 && shown < bytes ? `first ${shown} of ${whole}` : whole;
 }
 
 /** What a turn that produced no words says instead. */

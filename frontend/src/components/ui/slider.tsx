@@ -11,8 +11,16 @@ function Slider({
   value,
   min = 0,
   max = 100,
+  valueText,
   ...props
-}: React.ComponentProps<typeof SliderPrimitive.Root>) {
+}: React.ComponentProps<typeof SliderPrimitive.Root> & {
+  /**
+   * What the current value is *called*. A slider whose stops are named
+   * things — effort rungs, sizes — should say the name, not the index:
+   * "Grounded", not "1 of 5".
+   */
+  valueText?: string
+}) {
   const _values = React.useMemo(
     () =>
       Array.isArray(value)
@@ -42,13 +50,14 @@ function Slider({
       >
         <SliderPrimitive.Range
           data-slot="slider-range"
-          className="absolute bg-primary select-none data-horizontal:h-full data-vertical:w-full"
+          className="absolute bg-ink select-none data-horizontal:h-full data-vertical:w-full"
         />
       </SliderPrimitive.Track>
       {Array.from({ length: _values.length }, (_, index) => (
         <SliderPrimitive.Thumb
           data-slot="slider-thumb"
           key={index}
+          aria-valuetext={valueText}
           // `.glass-tile` is the surface; the ring is the hover/focus
           // affordance and stays a Tailwind utility because it is a
           // box-shadow the tile does not set.

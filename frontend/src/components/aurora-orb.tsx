@@ -71,7 +71,7 @@ export function AuroraOrb({
     <div
       data-state={state}
       style={{ "--orb-live": listening ? level : 0 } as CSSProperties}
-      className="orb relative grid aspect-square w-[min(68vw,19rem)] place-items-center"
+      className="orb relative grid aspect-square w-[min(62vw,42dvh,19rem)] place-items-center"
     >
       {/* echo rings, only while capturing */}
       {listening && (

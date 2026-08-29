@@ -4,6 +4,16 @@
 /* Clerk's components, themed off the same shadcn tokens as everything else. */
 @import "@clerk/ui/themes/shadcn.css";
 
+/*
+ * The one breakpoint on this screen that measures height rather than width.
+ *
+ * A phone held sideways is 850px wide and 390px tall — every width-based
+ * breakpoint calls it a small laptop, and the stage it lays out is nearly
+ * twice as tall as the viewport. `short:` is how the stage sheds the parts it
+ * cannot afford there without any of that leaking into the portrait layout.
+ */
+@custom-variant short (@media (max-height: 34rem));
+
 /* ---------------------------------------------------------------
    Vec — voice theme
    One theme, no toggle: a plain white room, ink and grey for everything
@@ -557,8 +567,8 @@
 
 /*
  * Selected, and staying that way. `aria-current` is the history list, the
- * two `data-state`s are Radix's popover triggers, `aria-pressed` is the
- * hands-free toggle, `data-active` is everything with no ARIA of its own.
+ * two `data-state`s are Radix's popover triggers, `aria-pressed` is any
+ * toggle left on, `data-active` is everything with no ARIA of its own.
  * One step past hover, so a hovered row and the open one stay distinct.
  */
 .glass-row[aria-current]:not([aria-current="false"]),

@@ -1,6 +1,15 @@
+import type { Metadata } from "next";
 import { Suspense } from "react";
 
 import { ConsentResult } from "@/components/consent-result";
+
+export const metadata: Metadata = {
+  title: "Connecting",
+  description:
+    "Where Composio sends the browser back after you approve a toolkit for your own account.",
+  // A consent landing page is a redirect target, never a destination.
+  robots: { index: false, follow: false },
+};
 
 /**
  * Where Composio sends the browser back after consent.
@@ -17,7 +26,7 @@ import { ConsentResult } from "@/components/consent-result";
  */
 export default function IntegrationPage() {
   return (
-    <main className="stage flex min-h-dvh flex-1 flex-col items-center justify-center gap-4 px-6 py-20">
+    <main className="stage flex min-h-dvh flex-1 flex-col items-center justify-center gap-4 px-4 py-24 sm:px-6">
       {/*
         `useSearchParams` opts the subtree into client-side rendering, and
         without a boundary that would opt the whole route out of static

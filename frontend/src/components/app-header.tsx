@@ -7,7 +7,7 @@ import Link from "next/link";
  */
 export function AppHeader() {
   return (
-    <header className="pointer-events-none fixed inset-x-0 top-0 z-40 flex items-center px-6 py-5">
+    <header className="pointer-events-none fixed inset-x-0 top-0 z-40 flex items-center px-4 py-4 sm:px-6 sm:py-5">
       <Link
         href="/"
         className="glass-row pointer-events-auto -mx-2 flex items-center gap-2.5 rounded-full px-2 py-1 outline-none focus-visible:ring-2 focus-visible:ring-ink/30 focus-visible:ring-offset-4 focus-visible:ring-offset-canvas"

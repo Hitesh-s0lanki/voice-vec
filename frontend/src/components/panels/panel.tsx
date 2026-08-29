@@ -14,7 +14,12 @@ export function PanelHeading({
   children?: ReactNode;
 }) {
   return (
-    <div className="flex items-start justify-between gap-3 px-1 pt-0.5">
+    // `data-slot` so a sheet can reserve room for its close button without
+    // every panel having to know it is in one.
+    <div
+      data-slot="panel-heading"
+      className="flex items-start justify-between gap-3 px-1 pt-0.5"
+    >
       <div className="flex flex-col gap-0.5">
         <p className="text-[0.82rem] font-medium tracking-[-0.01em] text-ink">
           {title}

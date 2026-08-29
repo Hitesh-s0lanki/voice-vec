@@ -102,9 +102,8 @@ Both classes also answer to the states a control can be *left* in:
 ```
 
 One step past hover, so a hovered row and the open one stay distinct. This is why the rail
-buttons, the history rows, the effort levels, the hands-free pill and the running activity
-step all get their selected ground for free — they already carried the right ARIA, and now
-something reads it. **Never add a second `bg-*` utility for a selected state**; it will be
+buttons, the history rows and the running activity step all get their selected ground for
+free — they already carried the right ARIA, and now something reads it. **Never add a second `bg-*` utility for a selected state**; it will be
 overridden (see below) and the two will drift.
 
 ### Where it enters
