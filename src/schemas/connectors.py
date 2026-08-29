@@ -61,8 +61,91 @@ class ConnectorList(Wire):
     # credential at all. Different from "you have not connected anything", and
     # only one of the two is the signed-in user's to fix.
     configured: bool = True
-    # Which connector is currently answering this user's retrieval, if any.
-    # Null means the deployment's own store, which is the default and fine.
+    # Which connector is currently answering this user's retrieval. Null means
+    # *nothing* answers it — there is no deployment corpus behind this app, so
+    # a user with no vector store attached has nowhere to be searched and /ask
+    # says so (docs/13-connectors.md).
+    vector_backend: str | None = None
+
+
+class ProfileField(Wire):
+    """One metadata key on the connected store, and how much of it carries it.
+
+    `coverage` rather than a bare presence flag: a key on 3% of an index is not
+    something a query may filter on, and the two are indistinguishable to
+    anything that only records whether the key was ever seen.
+    """
+
+    name: str
+    types: list[str] = []
+    coverage: float = 0.0
+    distinct: int | None = None
+    examples: list[str] = []
+    filterable: bool = False
+    # One value across the whole sample — carried, and useless for narrowing.
+    constant: bool = False
+
+
+class ConnectorProfile(Wire):
+    """What this app understood about a connected store, measured and written.
+
+    Two halves that are deliberately not merged. `facts` is measured and is
+    what the retrieval path acts on; `summary`, `topics`, `good_for` and
+    `not_for` are written by a model over sampled text and only steer routing.
+    A caller that confuses them turns a wrong sentence into a wrong query.
+    """
+
+    connector: str
+    kind: str
+    # pending | ok | degraded | failed
+    status: str
+    # Where it points, with no credential in it.
+    location: str = ""
+    reachable: bool = False
+
+    title: str = ""
+    summary: str = ""
+    topics: list[str] = []
+    good_for: list[str] = []
+    not_for: list[str] = []
+
+    records: int | None = None
+    dimensions: int | None = None
+    metric: str = ""
+    index: str = ""
+    sampled: int = 0
+    text_field: str = ""
+    scripts: list[str] = []
+    fields: list[ProfileField] = []
+    # Things a person should be told in their own words — a column that is the
+    # same on every row, a namespace holding vectors nobody is searching.
+    notes: list[str] = []
+
+    # The measured capabilities. `filters` here is the answer every backend
+    # used to hard-code as true.
+    lexical: bool = False
+    filters: bool = False
+    parallel_text: bool = False
+    searchable: bool = False
+
+    # The agent-facing rendering: what goes into a system prompt verbatim.
+    card: str = ""
+    error: str = ""
+    profiled_at: datetime | None = None
+
+
+class Capabilities(Wire):
+    """Everything the agent knows it can reach right now, in one call.
+
+    `card` is the block that goes into a system prompt as-is. The structured
+    profiles are beside it for a panel that wants to render the same thing with
+    its own layout, never as a second source of truth.
+    """
+
+    card: str = ""
+    profiles: list[ConnectorProfile] = []
+    # Which store is answering retrieval. Null means nothing is: retrieval
+    # abstains until this user connects one.
     vector_backend: str | None = None
 
 

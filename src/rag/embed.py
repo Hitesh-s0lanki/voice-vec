@@ -128,3 +128,17 @@ class Embedder:
 @lru_cache
 def get_embedder() -> Embedder:
     return Embedder(get_settings())
+
+
+# `get_embedder_for`, `known_models` and `model_dim` lived here: a per-store
+# embedder loaded from HuggingFace, chosen by a model name typed on the form.
+# Both halves were wrong. The form could not help anyone answer the question —
+# the reasonable reply to "stores 768-dimensional vectors" is `768`, which
+# fastembed spent 39 seconds trying to download as a repository — and the
+# widths most connected stores actually use, 1536 and 3072, have no locally
+# loadable model at all.
+#
+# A connected store of another width is now embedded by
+# `src/rag/remote_embed.py`, which asks `text-embedding-3` for exactly the
+# width read from that store's catalogue. Nothing is typed and nothing is
+# downloaded.
