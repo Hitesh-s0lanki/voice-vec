@@ -69,6 +69,23 @@ class VectorBackend(Protocol):
         """What this store can do beyond dense search. Never raises."""
         ...
 
+    def embed_query(self, text: str) -> np.ndarray:
+        """Turn a question into a vector *this* store can be searched with.
+
+        The backend owns this, rather than the pipeline embedding once and
+        handing the vector down, because a connected index was built by
+        whatever model its owner used and a 384-dimensional query cannot be
+        compared to a 768-dimensional index. No column mapping or distance
+        metric reconciles that after the fact; the only honest answer is to
+        embed with the model that built the index.
+
+        A connected store built at this app's own width returns the local
+        embedding, so this costs nothing in the common case — it is the same
+        embedder, reached through the object that knows whether it is the
+        right one.
+        """
+        ...
+
     def search(
         self,
         vector: np.ndarray,

@@ -11,7 +11,7 @@ project. Two people share no connector state at all.
 | Composio | `tools` | Link Gmail, Slack, Notion — through *their* Composio project |
 | Pinecone | `vector` | Their questions are searched against their index |
 | Astra DB | `vector` | Same, against a collection in their Astra database |
-| Postgres + pgvector | `vector` | Same, against their own Postgres |
+| Postgres + pgvector | `vector` | Same, against any pgvector table in their own Postgres |
 
 ```
 panel ─► PUT /connectors/{slug} {values}
@@ -32,8 +32,17 @@ the React form is built from it.
 The alternative, a component per service, means every connector touches two languages, and
 means the form and the server-side validation drift the first time either is edited.
 
-So a fifth connector is [`registry.py`](../src/connectors/registry.py) plus — for a vector
-store — a backend under [`src/rag/backends/`](../src/rag/backends/). No frontend change.
+So a new connector is [`registry.py`](../src/connectors/registry.py) plus — for a vector
+store — a backend under [`src/rag/backends/`](../src/rag/backends/).
+
+**No frontend change for a new connector; one line for a new *kind*.** That
+distinction was found rather than designed. The panel renders a section per kind
+from a `GROUPS` array and filters rows into it, so `dataset` arriving as a third
+kind was a connector the server offered and the panel silently dropped — not an
+error, not an empty section, just absent. A fifth *vector* connector still costs
+no frontend edit; a third kind costs `ConnectorKind` in
+[`connectors.ts`](../frontend/src/lib/connectors.ts) and an entry in `GROUPS`,
+and the two are commented to be edited together.
 
 `secret` is the flag that matters most. It decides three separate things: the input renders
 as a password, the value is never sent back to the browser, and only its last four
@@ -83,24 +92,31 @@ that name; it seals every connector.)
 [`resolve.py`](../src/rag/backends/resolve.py) decides, per request:
 
 ```
-signed out            ─► the deployment's own store
-nothing connected     ─► the deployment's own store
+signed out            ─► nothing
+nothing connected     ─► nothing
 Pinecone connected    ─► theirs
 several connected     ─► PREFERENCE order, so it is the same one every request
-connected but empty   ─► the deployment's own store
-anything goes wrong   ─► the deployment's own store
+connected but empty   ─► nothing
+anything goes wrong   ─► nothing
 ```
 
-Two rules that are cheap to state and expensive to get wrong. **Fall back, never cross
-over**: the only per-user thing in that module is a credential lookup that takes a user id,
-so a failure resolves to the *deployment* store and never to somebody else's. And **a broken
-connector degrades retrieval rather than deleting it** — `for_user` never raises.
+`nothing` is `None`, and it is a real answer rather than an error. **There is no deployment
+corpus behind this app.** There used to be — a `chunks` table built by an ingest script from
+one dataset, which everybody fell back to — and it is gone. What a question can be answered
+from is exactly what its asker attached.
+
+So the two rules restate as one: **return nothing, never somebody else's.** The only
+per-user thing in that module is a credential lookup that takes a user id, and there is no
+shared store left to reach for, so a failure cannot resolve to another account's index.
+`for_user` still never raises: `/ask` turns `None` into *"I don't have a source to search
+yet — connect a vector store and I can answer from it"*, which is a true and actionable
+answer where a 500 would read as the app being broken.
 
 **Built is not the same as searchable.** `verify` runs once, when the form is submitted, and
 an index can be emptied, dropped or renamed long after that. So a freshly built backend is
-probed with `ready()` before it is used, and one that answers no falls through to the
-deployment store — which is the difference between a degraded answer and *"my sources are
-unavailable"* on every question. The probe is `SELECT 1 … LIMIT 1`, not `count(*)`, because
+probed with `ready()` before it is used, and one that answers no is treated as nothing
+attached — which is what turns it into *"connect a vector store"* rather than an error from
+a layer the asker cannot place. The probe is `SELECT 1 … LIMIT 1`, not `count(*)`, because
 it runs against somebody else's database and a cost that grows with their corpus is a cost
 that times out on the indexes most worth connecting.
 
@@ -113,21 +129,23 @@ database, sized to 2 because this app is a guest in it.
 
 ## What the vector backends do and don't do
 
-`VectorStore` in [`store.py`](../src/rag/store.py) does ingest, schema, index building,
-warming and counting as well as searching. Three of those are meaningless for an index
-somebody else populated, and one — search — is all the answer path calls. So
-[`base.py`](../src/rag/backends/base.py) is deliberately narrow: `search`, `ready`,
-`describe`. That is what makes a backend a hundred lines instead of a second ingest pipeline.
+`VectorStore` in [`store.py`](../src/rag/store.py) used to do ingest, schema, index
+building, warming and counting as well as searching. All of those were meaningless for an
+index somebody else populated, and one — search — is all the answer path ever called. They
+are gone with the deployment corpus, and what is left is the query half, whose only caller
+is `PgVectorBackend`. [`base.py`](../src/rag/backends/base.py) is narrow for the same
+reason: `search`, `ready`, `describe`.
 
-**Ingest is still deployment-side.** [`scripts/ingest.py`](../scripts/ingest.py) writes to
-the app's own Postgres. A user who connects Pinecone is searching an index *they* populated,
-and the schema it has to satisfy is the metadata read in each backend's `_hit`. Per-user
-ingest is not built.
+**Nothing is ingested here at all.** This app reads connected stores and writes to none of
+them; `DATABASE_URL` holds conversations, credentials, profiles and datasets, and is never
+searched. A user who connects Pinecone is searching an index *they* populated, and the
+metadata it has to carry is what each backend's `_hit` reads.
 
-For pgvector that schema is not a convention, it is the search: `PgVectorBackend` forwards
-to `VectorStore`, so the table it points at must be the one `ingest.py` builds —
-`chunk_key`, `strategy`, `text`, `meta`, `language` and `embedding` / `embedding_en` at the
-app's embedding dimension. `verify_pgvector` reads the catalogue and says which of those are
+For pgvector the schema is not a convention, it is the search: `PgVectorBackend` forwards
+to `VectorStore`, and the column names come from a `ColumnMap` discovered at verify time
+([`columns.py`](../src/rag/columns.py)) rather than being assumed — so a table holding `id`
+and `chunk_text` is searchable, and a table missing `tsv` loses the lexical channel instead
+of being rejected. `verify_pgvector` reads the catalogue and says what is
 missing while the form is still open, rather than letting a Postgres full of somebody's own
 `book_chunks` connect green and abstain on everything. `tsv` and `tsv_en` are deliberately
 *not* required: a table built by an older migration has none, and rung 2 already degrades a
@@ -157,7 +175,7 @@ and still does. Identity there is optional and only decides *which store answers
 ## The agent actually calling tools
 
 Linking a toolkit is not the point on its own — the point is that a spoken turn can *use*
-it. [`agent.py`](../src/integrations/agent.py) turns a user's live connections into tool
+it. [`tool_agent.py`](../src/agents/tool_agent.py) turns a user's live connections into tool
 schemas, and [`_use_tools`](../src/services/voice_service.py) runs the loop:
 
 ```
@@ -208,20 +226,26 @@ anybody.
 ## What gets written down
 
 A tool call is the one thing a spoken turn does that has an effect *outside* this app. A
-message can be re-read; an email is sent. So [`tool_calls`](../src/chat/tools.py) records
+message can be re-read; an email is sent. So [`tool_calls`](../src/chat/tool_calls.py) records
 every one, for three readers: the user (the thread shows what ran, under the turn that
 caused it), the operator (a tool failing for everybody looks like the model being unhelpful
 until a table says otherwise), and anyone auditing an agent with access to a mailbox.
 
-| Stored | Not stored |
-| --- | --- |
-| slug, toolkit, arguments, status, error, latency, `user_id`, `turn_id` | **the result** — only its size |
+| Stored whole | Stored bounded | Not stored |
+| --- | --- | --- |
+| slug, toolkit, status, error, latency, `user_id`, `turn_id` | arguments, and the **head** of the result plus `result_bytes` | the rest of a result past `MAX_RESULT_CHARS` |
 
-**Arguments in, results not.** The arguments are what the agent *decided*, which is the
-interesting half and is small. A result can be an entire inbox page and belongs to the
-provider: storing it would turn an audit trail into an uncontrolled copy of everything the
-agent has ever read, which is a worse thing to hold than the credential that reached it.
-`ToolCall` on the wire has no field that could carry one, and a test asserts that.
+**Both halves of the call, and the second one capped.** The arguments are what the agent
+*decided*; the result is what came *back*, and without it the thread cannot be read —
+"it ran `GMAIL_FETCH_EMAILS`" says nothing about what the answer was built from. So the
+first 4,000 characters go down beside `result_bytes`, which stays the size of the *whole*
+thing: the card reads "first 4013 of 6.0k chars" rather than implying it has all of it.
+
+The ceiling is the containment. A result can be an entire inbox page and belongs to the
+provider; a preview is what keeps this table from becoming an uncontrolled copy of
+everything the agent has ever read. It is still somebody's mail — read back only by the
+account that owns the conversation, and worth the same care as the credential that
+reached it.
 
 Arguments are bounded too — an oversized one is replaced by a marker rather than the call
 being dropped, because knowing `GMAIL_SEND_EMAIL` ran is most of the record's value.
@@ -239,6 +263,135 @@ the auth configs keyed `(user_id, toolkit)`, the reconcile-and-revoke rules, and
 Disconnecting Composio drops its toolkit rows, because they name ids inside a project this
 app can no longer reach. It revokes **nothing** upstream: those connections live in the
 user's own account and stay theirs.
+
+## Their schema, not ours
+
+`verify` used to require the connected table to carry this app's exact columns —
+`chunk_key`, `strategy`, `text`, `meta`, `language`, `embedding_en` — because
+[`store.py`](../src/rag/store.py)'s queries named them as literals. That made "connect your
+own Postgres" mean "connect a copy of ours": a working pgvector table holding `id` and
+`chunk_text` was turned away at the form for lacking columns its owner had never heard of.
+
+[`columns.py`](../src/rag/columns.py) makes the names data. A `ColumnMap` says which column
+plays each role, `verify` discovers one from the catalogue, and it is sealed beside the DSN
+under `col_*` keys. The bar is now **readability, not sameness**:
+
+| Role | Required? | Absent means |
+| --- | --- | --- |
+| `embedding` | yes | nothing to search |
+| `text` | yes | nothing to quote an answer out of |
+| `strategy` | no | the predicate is *dropped* — `filters` is false |
+| `tsv` | no | no keyword channel — `lexical` is false |
+| `english`, `embedding_en` | no | no native English retrieval |
+| `meta` | no | up to six scalar columns are carried instead, so a hit can cite its source |
+
+**An absent column is a lost capability, never a substituted one.** A dropped predicate is
+honest; one defaulted to match everything is a narrowing the ladder believes it applied.
+`Capabilities` is read off the map, so rung 2 is told dense-only before it asks.
+
+The default map reproduces the schema this app used to ingest into, and generates the query
+it replaced *character for character* — pinned by
+[`test_columns.py`](../tests/test_columns.py), because that query is the measured hot path
+and a silent SQL change in it is a latency regression nobody could attribute. Those literals
+are gone from `store.py`; the constants in the test are pasted rather than imported, which
+is exactly why they outlived them.
+
+## Every case a connected store can present
+
+Enumerated once, rather than discovered one connection at a time.
+
+| What differs | How it is handled |
+| --- | --- |
+| Table field left blank | discovered — one vector table is used, several are named so you can pick |
+| No table with vectors | said as a fact about *their* database, not about our default |
+| Column names | `ColumnMap`, discovered from the catalogue at verify time |
+| No `strategy` / `language` | predicate **dropped**; `filters` false |
+| No `tsv` | `lexical` false — rung 2 told before it asks |
+| No English pair | `parallel_text` false; an English question takes the cross-lingual hop |
+| No `meta` | up to six scalar columns carried, so a hit can cite its source |
+| No text column | rejected — searchable but unquotable is not usable |
+| `halfvec` instead of `vector` | accepted; same search, half the index |
+| Distance is l2 or inner product | operator **and** score expression read off the index opclass |
+| No ANN index at all | works; the profile notes the sequential scan |
+| **Width differs** | query embedded remotely at exactly that width — nothing asked |
+| Store built by a different model | caught by a round trip; the store is marked unroutable |
+| Semantic cache width | semantic half skipped, exact half kept |
+| Empty index | `searchable` false, with the reason |
+| Table in another schema | `schema.table` accepted; the picker lists qualified names |
+| Mixed-case or spaced table name | quoted in every generated query |
+
+## Which tooling's tables actually work
+
+Pinned as regression tests in [`test_profiles.py`](../tests/test_profiles.py), because these
+are what people connect:
+
+| Built by | Text | Id | Metadata |
+| --- | --- | --- | --- |
+| LangChain (`langchain_postgres`) | `document` | `id` | `cmetadata` |
+| LangChain (community, legacy) | `document` | `uuid` | `cmetadata` |
+| LlamaIndex `PGVectorStore` | `text` | `id` | `metadata_` |
+| Supabase quickstart | `content` | `id` | `metadata` |
+| pgai vectorizer | `chunk` | `id` | — (`chunk_seq` carried) |
+| Django / hand-rolled | `body` | `id` | — (`title` carried) |
+| This app | `text` | `chunk_key` | `meta` |
+
+**Names are a hint; the data is the answer.** Writing that table out is what exposed the bug:
+in LangChain's schema `id`, `collection_id` and `document` are all `character varying`, and a
+name-only heuristic picked `id` — so every answer from the single most widely used pgvector
+integration would have been quoted from a UUID. Verify now reads five rows and takes the
+column whose values are actually prose. An empty table falls back to the names, which is
+still right most of the time.
+
+Two other cases are worth their own paragraph.
+
+**Width.** A 768-dimensional index and a 384-dimensional query are not comparable, and
+nothing after the fact reconciles them. OpenAI's `text-embedding-3` models take a
+`dimensions` parameter, so the width read from the store's own catalogue *is* the answer:
+[`remote_embed.py`](../src/rag/remote_embed.py) asks for exactly that many dimensions and
+the form asks nothing.
+
+The first attempt took a model name on the form instead. That was wrong twice. The question
+was unanswerable by the person being asked — the reasonable reply to "stores 768-dimensional
+vectors" is `768`, which is what happened, and fastembed spent 39 seconds trying to download
+a HuggingFace repository by that name. And it could not serve the common case anyway: 1536
+and 3072, which is what most connected stores are actually built at, have no locally
+loadable model at all.
+
+The cost is honest and it is real: **a network call on the answer path**, which
+[04-latency.md](04-latency.md)'s zero-network-calls rule otherwise forbids. It is confined to
+connected stores of another width — a connected Pinecone or Astra is already a round trip —
+and measured from `ap-southeast-1` it ran 0.4–2.5 s, dominated by provider variance. The
+harness deadline is what keeps it honest.
+
+**A store built by a different model** is the case that looks handled and is not. Matching
+the width makes the arithmetic legal, not the answer meaningful — a store embedded with
+Gemini or bge at 768 returns neighbours of a query vector that has nothing to do with it. The
+profiler catches it with a round trip on **every** connected vector store, whatever its
+width: lift a passage out of the store, embed it the way queries are embedded, ask the store
+for it back. Built the same way, it retrieves itself near 1.0. Measured on a real one that
+was not:
+
+```
+a passage from this store retrieves itself at only 0.06 —
+it was not built with the embeddings this app queries it with
+```
+
+That gates routing, not just the card. A false negative costs an abstention that names the
+store; a false positive is confident garbage nobody can detect.
+
+## Connecting is not understanding
+
+A verified credential proves the store answers. It says nothing about what is in it, and
+every backend has hard-coded its answer to "what can this store do" since connectors
+shipped — `filters=True` for every Pinecone index on earth, on the hope that it carries a
+`strategy` field.
+
+[17-understanding.md](17-understanding.md) is the layer that measures instead: a probe
+samples the connected store, a model names what it holds, and the result is stored so the
+agent reads a paragraph rather than a guess. Adding a fifth connector means adding a probe
+beside its backend — [`src/connectors/probes/`](../src/connectors/probes/) — or accepting
+that its capabilities stay declared rather than measured, which is the same behaviour this
+app had before.
 
 ## Configuration
 
@@ -258,3 +411,10 @@ different sentence from "you have not connected anything", and only one of the t
 user's to fix.
 
 `uv run python -m scripts.migrate` creates every table.
+
+```bash
+PROFILE_ENABLED=true       # probe a store when it is connected
+PROFILE_EXCERPTS=true      # may passages of the user's data reach the summarising model
+PROFILE_NARRATE=true       # write a summary at all, or keep the profile to measurements
+PROFILE_TTL_HOURS=24       # how long an understanding is trusted before a refresh
+```

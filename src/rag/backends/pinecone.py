@@ -40,6 +40,7 @@ class PineconeBackend:
         self._index = credentials["index"]
         self._namespace = (credentials.get("namespace") or "").strip()
         self._cached_host: str | None = None
+        self._dim = int(credentials.get("dim") or 0)
 
     @property
     def name(self) -> str:
@@ -48,6 +49,32 @@ class PineconeBackend:
     def describe(self) -> str:
         where = f"pinecone/{self._index}"
         return f"{where}#{self._namespace}" if self._namespace else where
+
+
+    def embed_query(self, text: str) -> np.ndarray:
+        """Embedded at *this* store's width, locally when that is ours.
+
+        A connected index built at another width is embedded remotely, because
+        `text-embedding-3` can be asked for exactly that many dimensions
+        (`src/rag/remote_embed.py`). Nothing was asked on the form and nothing
+        was downloaded — the width came from the store's own catalogue.
+        """
+        from src.core.config import get_settings
+        from src.rag.embed import get_embedder
+        from src.rag.remote_embed import RemoteEmbedUnavailable
+        from src.rag.remote_embed import embed_query as embed_remote
+
+        settings = get_settings()
+        if not self._dim or self._dim == settings.embed_dim:
+            return get_embedder().embed_query(text)
+
+        try:
+            return embed_remote(text, self._dim, settings=settings)
+        except RemoteEmbedUnavailable as error:
+            # `StoreUnavailable` is what the ladder already abstains on, so a
+            # provider outage degrades to "my sources are unavailable" rather
+            # than a 500 from a layer nobody can place.
+            raise StoreUnavailable(str(error)) from error
 
     def _host(self) -> str:
         if self._cached_host is None:

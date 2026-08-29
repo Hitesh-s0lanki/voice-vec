@@ -1,15 +1,10 @@
-"""Searching a Postgres the user connected, with this app's own schema.
+"""Searching a Postgres the user connected.
 
-The odd one of the three, because the code already exists. `VectorStore` in
-`src/rag/store.py` speaks exactly this — the same table, the same `<=>`, the
-same HNSW `ef_search` — and the only thing that differs is which database it
-points at and which pool it checks out of.
-
-So this does not reimplement it. It builds a `VectorStore` over a private pool
-against the user's DSN, and forwards. That is worth more than the lines it
-saves: the search SQL, the strategy filter and the language filter stay in one
-place, so a fix to the query cannot land for the deployment's store and miss
-everybody's connected one.
+`VectorStore` in `src/rag/store.py` is the query half of exactly this — the
+`<=>` search, the lexical channel, the HNSW `ef_search` — and since the
+deployment's own corpus went away it exists for no other caller. This is where
+it is pointed at a database: a private pool against the user's DSN, and the
+column map discovered when the connector was verified.
 
 The pool is private and small on purpose. A user's Neon has its own connection
 limit and this app is a guest in it — one or two connections is enough for a
@@ -26,8 +21,9 @@ import numpy as np
 
 from src.core.config import get_settings
 from src.core.db import Database
+from src.rag.columns import ColumnMap
 from src.rag.backends.base import Capabilities, Hit, StoreUnavailable
-from src.rag.store import VectorStore
+from src.rag.store import DEFAULT_TABLE, VectorStore
 
 log = logging.getLogger("vec.rag.pgvector")
 
@@ -35,7 +31,9 @@ log = logging.getLogger("vec.rag.pgvector")
 class PgVectorBackend:
     def __init__(self, credentials: Mapping[str, str]) -> None:
         settings = get_settings()
-        table = (credentials.get("table") or "").strip() or settings.pg_table
+        # `verify_pgvector` resolves the table and seals the name it settled
+        # on, so this is blank only for an account attached before it did.
+        table = (credentials.get("table") or "").strip() or DEFAULT_TABLE
 
         # A copy of the app's settings pointed somewhere else. Everything the
         # search depends on — ef_search, the statement timeout, the embedding
@@ -43,13 +41,30 @@ class PgVectorBackend:
         self._settings = settings.model_copy(
             update={
                 "database_url": credentials["dsn"],
-                "pg_table": table,
                 "pg_pool_min": 1,
                 "pg_pool_max": 2,
             }
         )
 
-        self._store = VectorStore(self._settings, Database(self._settings))
+        # The column map discovered when this connector was verified, sealed
+        # beside the DSN under `col_*` keys. Absent — an account attached
+        # before mapping existed — falls back to this app's own schema, which
+        # is what those accounts were verified against anyway.
+        columns = ColumnMap.from_mapping(
+            {
+                key[len("col_") :]: value
+                for key, value in credentials.items()
+                if key.startswith("col_")
+            }
+        )
+
+        self._store = VectorStore(
+            self._settings, Database(self._settings), columns, table
+        )
+
+        # Which model built this index, and how wide. Empty whenever the
+        # index matches this app's own width, which is the common case.
+        self._dim = int(credentials.get("dim") or settings.embed_dim)
 
     @property
     def name(self) -> str:
@@ -67,15 +82,13 @@ class PgVectorBackend:
             return False
 
     def capabilities(self) -> Capabilities:
-        """Whatever `VectorStore` can do, since that is what is running.
+        """Whatever `VectorStore` can do with *this* column map.
 
-        One caveat this cannot check cheaply: a user who pointed us at their
-        own Postgres may have built the table with an older migration and have
-        no `tsv` column. The lexical query would then fail — which the ladder
-        already handles, because rung 2 treats a failed lexical channel as an
-        empty contribution and falls back to dense-only rather than losing the
-        answer. Probing for the column on every request would cost a round trip
-        to save a failure that is both rare and already survivable.
+        The caveat this used to carry — that a table with no `tsv` column would
+        fail the lexical query — is gone. The map knows whether there is a
+        tsvector column, `VectorStore.capabilities()` reads it off, and rung 2
+        is told dense-only before it asks rather than discovering it from an
+        error. No round trip: the map was built when the connector was verified.
         """
         return self._store.capabilities()
 
@@ -102,6 +115,32 @@ class PgVectorBackend:
         return self._store.search_lexical(
             query, strategies=strategies, limit=limit, language=language
         )
+
+
+    def embed_query(self, text: str) -> np.ndarray:
+        """Embedded at *this* store's width, locally when that is ours.
+
+        A connected index built at another width is embedded remotely, because
+        `text-embedding-3` can be asked for exactly that many dimensions
+        (`src/rag/remote_embed.py`). Nothing was asked on the form and nothing
+        was downloaded — the width came from the store's own catalogue.
+        """
+        from src.core.config import get_settings
+        from src.rag.embed import get_embedder
+        from src.rag.remote_embed import RemoteEmbedUnavailable
+        from src.rag.remote_embed import embed_query as embed_remote
+
+        settings = get_settings()
+        if not self._dim or self._dim == settings.embed_dim:
+            return get_embedder().embed_query(text)
+
+        try:
+            return embed_remote(text, self._dim, settings=settings)
+        except RemoteEmbedUnavailable as error:
+            # `StoreUnavailable` is what the ladder already abstains on, so a
+            # provider outage degrades to "my sources are unavailable" rather
+            # than a 500 from a layer nobody can place.
+            raise StoreUnavailable(str(error)) from error
 
     def close(self) -> None:
         """Give the user's database its connections back."""
