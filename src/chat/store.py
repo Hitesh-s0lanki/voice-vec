@@ -38,10 +38,10 @@ from src.core.db import Database, DatabaseUnavailable, get_db
 
 log = logging.getLogger("vec.chat")
 
-# Fixed names, unlike the chunk table's `PG_TABLE`. That one is configurable
-# because an experiment may want a second index beside the live one; there is
-# no such reason to run two conversation tables, and a literal name keeps
-# every statement below a constant rather than an interpolation.
+# Fixed names. The one table name in this app that varies is the *connected*
+# store's, and it varies because it belongs to somebody else — there is no such
+# reason to run two conversation tables, and a literal name keeps every
+# statement below a constant rather than an interpolation.
 CONVERSATIONS = "conversations"
 MESSAGES = "messages"
 

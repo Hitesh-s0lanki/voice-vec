@@ -1,8 +1,25 @@
 [project]
 name = "voice-vec"
 version = "0.1.0"
-description = "Add your description here"
+description = "Vec — a voice backend that hears twenty-two Indian languages and answers out loud in the one it heard, over whatever vector store its asker connected."
+readme = "README.md"
 requires-python = ">=3.13"
+authors = [{ name = "Hitesh Solanki" }]
+keywords = [
+    "voice",
+    "speech-to-text",
+    "text-to-speech",
+    "sarvam",
+    "rag",
+    "retrieval-augmented-generation",
+    "pgvector",
+    "fastapi",
+]
+classifiers = [
+    "Private :: Do Not Upload",
+    "Framework :: FastAPI",
+    "Programming Language :: Python :: 3.13",
+]
 dependencies = [
     "duckdb>=1.5.5",
     "fastapi>=0.141.1",
@@ -35,6 +52,17 @@ dependencies = [
     # a hard dependency so that a deployment which *does* set the URL cannot
     # silently get exact-match caching because an extra was never installed.
     "redis>=5.2.0",
+    # The agents (src/agents/, docs/21-agents.md). `langchain-openai` talks to
+    # any OpenAI-compatible /chat/completions endpoint, which is the contract
+    # `Settings.resolve_llm()` already assumed — OpenAI's API and Sarvam's both
+    # satisfy it — so one client covers both providers. `langchain` itself is
+    # here for `create_agent`: the dataset agent's write-run-repair loop is a
+    # tool loop, and hand-rolling that loop is how a repair budget quietly
+    # becomes unbounded. The streaming voice path (src/voice/llm.py) is not on
+    # this: it needs token-level control of a socket that a listener is already
+    # hearing, and an abstraction in the middle of that buys nothing.
+    "langchain>=1.3.18",
+    "langchain-openai>=1.6.0",
 ]
 
 [dependency-groups]

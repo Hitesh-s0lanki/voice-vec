@@ -14,12 +14,20 @@ more care than the text around it, and for three different readers:
     tool_calls ─── conversation_id → conversations.id  (ON DELETE CASCADE)
                └── turn_id, so a call sits under the exchange that caused it
 
-**Arguments are stored; results are not stored whole.** The arguments are what
-the agent *decided*, which is the interesting half and is small. A result can be
-an entire inbox page and belongs to the provider, not here — so only its size,
-its status and any error are kept. Storing tool output wholesale would turn this
-table into an uncontrolled copy of everything the agent has ever read, which is
-a worse thing to hold than the credential that reached it.
+**Arguments are stored whole; results are stored as a bounded preview.** The
+arguments are what the agent *decided*, which is the interesting half and is
+small. The result is what came *back*, and the thread is unreadable without it —
+"it ran `GMAIL_FETCH_EMAILS`" says nothing about what the answer was built from.
+So the first `MAX_RESULT_CHARS` of the rendered result are kept, alongside
+`result_bytes`, which stays the size of the *whole* thing: the pair reads as
+"here is what came back, and here is how much of it you are seeing".
+
+The ceiling is the containment. A result can be an entire inbox page and belongs
+to the provider, not here; keeping a preview rather than the payload is what
+stops this table becoming an uncontrolled copy of everything the agent has ever
+read. It is still somebody's mail — the same care as the credential that reached
+it applies, and it is why a preview is read back only by the account that owns
+the conversation.
 
 The same rule as the rest of chat storage applies: **writing must never be able
 to break a turn.** Every call here runs off the voice path through the session's
@@ -41,13 +49,18 @@ from psycopg.types.json import Jsonb
 from src.chat.store import CONVERSATIONS
 from src.core.db import Database, get_db
 
-log = logging.getLogger("vec.chat.tools")
+log = logging.getLogger("vec.chat.tool_calls")
 
 TOOL_CALLS = "tool_calls"
 
 # Arguments do go in, so they are bounded. A model that emits a 100 KB argument
 # blob is malfunctioning and should not be able to fill a table over it.
 MAX_ARGUMENT_CHARS = 8_000
+
+# And so is the result preview. Deliberately smaller than the ceiling the model
+# itself sees (`src/agents/tool_agent.py`): this is the readable head of a
+# result, not a second copy of the provider's page.
+MAX_RESULT_CHARS = 4_000
 
 
 def new_tool_call_id() -> str:
@@ -65,6 +78,8 @@ class ToolCallRow:
     arguments: dict
     status: str
     error: str | None
+    #: The head of what came back — see `trim_result`. None when nothing did.
+    result: str | None
     result_bytes: int | None
     latency_ms: float | None
     created_at: datetime
@@ -94,11 +109,18 @@ CREATE TABLE IF NOT EXISTS {TOOL_CALLS} (
     -- ok · failed · refused
     status          TEXT NOT NULL,
     error           TEXT,
-    -- The size of what came back, not what came back. See the module docstring.
+    -- The head of what came back, bounded. See the module docstring.
+    result          TEXT,
+    -- The size of the whole of it, so a preview can say what it is a preview of.
     result_bytes    INTEGER,
     latency_ms      DOUBLE PRECISION,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- `result` arrived after the table did, and `ensure_schema` only ever creates.
+-- Adding it here rather than in a migration keeps the one rule this module has:
+-- a database that comes up in any state starts working on the next turn.
+ALTER TABLE {TOOL_CALLS} ADD COLUMN IF NOT EXISTS result TEXT;
 
 -- Every read is "the calls in this conversation, in the order they ran".
 CREATE INDEX IF NOT EXISTS {TOOL_CALLS}_thread
@@ -111,7 +133,7 @@ CREATE INDEX IF NOT EXISTS {TOOL_CALLS}_user
 
 _COLUMNS = (
     "id, conversation_id, turn_id, user_id, toolkit, slug, arguments, status, "
-    "error, result_bytes, latency_ms, created_at"
+    "error, result, result_bytes, latency_ms, created_at"
 )
 
 
@@ -126,9 +148,10 @@ def _row(row: Sequence[Any]) -> ToolCallRow:
         arguments=dict(row[6] or {}),
         status=row[7],
         error=row[8],
-        result_bytes=int(row[9]) if row[9] is not None else None,
-        latency_ms=float(row[10]) if row[10] is not None else None,
-        created_at=row[11],
+        result=row[9],
+        result_bytes=int(row[10]) if row[10] is not None else None,
+        latency_ms=float(row[11]) if row[11] is not None else None,
+        created_at=row[12],
     )
 
 
@@ -164,6 +187,22 @@ def trim(arguments: dict) -> dict:
     return trimmed
 
 
+def trim_result(rendered: str | None) -> str | None:
+    """The head of a result, marked when there is more of it.
+
+    Empty and whitespace-only results become None rather than a blank row: a
+    tool that returned nothing is better read from its status than from an
+    empty box in the thread.
+    """
+    text = (rendered or "").strip()
+    if not text:
+        return None
+
+    if len(text) <= MAX_RESULT_CHARS:
+        return text
+    return text[:MAX_RESULT_CHARS] + "… (truncated)"
+
+
 class ToolCallStore:
     def __init__(self, db: Database | None = None) -> None:
         self._db = db or get_db()
@@ -188,15 +227,24 @@ class ToolCallStore:
         *,
         slug: str,
         status: str,
+        id: str | None = None,
         conversation_id: str | None = None,
         turn_id: str | None = None,
         user_id: str | None = None,
         arguments: dict | None = None,
         error: str | None = None,
+        result: str | None = None,
         result_bytes: int | None = None,
         latency_ms: float | None = None,
     ) -> ToolCallRow | None:
-        """Write one call down. Returns None when there is no database."""
+        """Write one call down. Returns None when there is no database.
+
+        `id` is a parameter rather than always minted here so the caller can
+        mint it *before* the write and put the same one on the wire — the voice
+        socket announces a finished call immediately and this row lands a
+        moment later, and the two being the same call has to be something the
+        client can see rather than infer from a slug and a timestamp.
+        """
         if not slug:
             return None
 
@@ -206,12 +254,12 @@ class ToolCallStore:
                 f"""
                 INSERT INTO {TOOL_CALLS}
                     (id, conversation_id, turn_id, user_id, toolkit, slug,
-                     arguments, status, error, result_bytes, latency_ms)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     arguments, status, error, result, result_bytes, latency_ms)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING {_COLUMNS}
                 """,
                 (
-                    new_tool_call_id(),
+                    id or new_tool_call_id(),
                     conversation_id,
                     turn_id,
                     user_id,
@@ -220,6 +268,7 @@ class ToolCallStore:
                     Jsonb(trim(arguments or {})),
                     status,
                     (error or None) and str(error)[:500],
+                    trim_result(result),
                     result_bytes,
                     latency_ms,
                 ),

@@ -156,6 +156,15 @@ def _key(llm: LlmTarget) -> str:
 # absence is audible: markdown gets read out as punctuation, a six-sentence
 # answer outlasts the listener's patience, and a model that quietly switches to
 # English is the single most common way a multilingual voice app breaks.
+#
+# The `Facts` block is newer and is here because the answering path changed.
+# With the vector index off (docs/18-datasets.md), the only grounded source is
+# a dataset queried through a tool — and a model handed a *description* of a
+# dataset will happily answer from the description. "How many Hindi rows are
+# there" gets "about twenty-five thousand" read straight off the card, spoken
+# with total confidence, without a query ever running. Out loud there is
+# nothing to distinguish that from a real answer: no citation, no row count, no
+# SQL a listener could check. So the rule is stated as a rule.
 _SYSTEM = """You are Vec, a voice assistant. Everything you write is spoken aloud immediately.
 
 Language:
@@ -168,6 +177,14 @@ Voice:
 - Plain spoken sentences. No markdown, no bullet points, no emoji, no headings, no code blocks.
 - Write numbers, dates and units the way you would say them out loud.
 - If you do not know, say so briefly and stop.
+
+Facts:
+- Any number, count, total, comparison, or specific record about data you can reach
+  must come from actually running a query. Never read one off a description, and
+  never estimate one from memory.
+- When results come back cut short, say so — "at least forty" and not "forty".
+- When they describe part of a dataset rather than all of it, say that too.
+- Never read a list of results aloud. Say how many there were and name one or two.
 """
 
 _LANGUAGE_UNKNOWN = "the same language the user spoke"
@@ -177,6 +194,8 @@ def system_prompt(
     language_code: str | None,
     context: str | None = None,
     memories: str | None = None,
+    stores: str | None = None,
+    discovery: bool = False,
 ) -> str:
     """The instruction the model opens with, aimed at the detected language."""
     name = display(language_code)
@@ -207,8 +226,52 @@ def system_prompt(
             "contradicts it, they are right and it is out of date.\n"
         )
 
+    if stores:
+        # What this listener has connected, measured rather than assumed:
+        # stores and tools from `src/connectors/profile.py`, and datasets from
+        # `src/datasets/profile.py`. A string, already rendered, because this
+        # module may not import either — `src.connectors.narrate` reaches
+        # `src.rag.llm`, which imports this file, and the cycle would close on
+        # the first profile written.
+        #
+        # Framed as *reach* rather than as knowledge, and that framing is doing
+        # more work now than it used to. A model handed a list of corpora
+        # starts answering from the list — "I have twelve books on habits" —
+        # and a model handed a dataset card starts answering from the card,
+        # which is worse: the card carries real numbers, so what it recites
+        # sounds exactly like a measurement. The `Facts` rules above are the
+        # other half of this; both are needed, because the card cannot be
+        # withheld (it is how the model decides whether to query at all) and it
+        # cannot be trusted to be read as a menu rather than as an answer.
+        prompt += (
+            "\nWhat you can reach for this person:\n"
+            f"{stores}\n"
+            "This is reach, not knowledge: it is what you can look up, act on or "
+            "query, and it is never the answer itself. Anything countable or "
+            "specific comes from running a query against it. If a question falls "
+            "outside all of it, say you do not have it rather than answering from "
+            "memory.\n"
+        )
+        if discovery:
+            # The counts above say *that* something is there; this says how to
+            # find out what. Written as the first step rather than as an
+            # option, because the failure it prevents is silent: a model that
+            # skips discovery answers a question about somebody's own data from
+            # its own memory, fluently, with nothing to mark it as invented.
+            prompt += (
+                "You have not been told what any of it holds. Before answering "
+                "anything that needs their data or an action, call "
+                "`find_capability` with what you need in plain words; it names "
+                "which one fits and the exact tool to call next. Never guess "
+                "which source to use, and never answer from these counts.\n"
+            )
+
     if context:
-        # Only reachable with RAG_ENABLED=true. Retrieval is off in this build.
+        # Only reachable for a listener who attached a vector store: the index
+        # is not the whole answering path any more (docs/18-datasets.md).
+        # Retrieval and datasets are additive rather than alternatives — a
+        # connected index appends passages here while the dataset tool keeps
+        # answering the countable half — so both can be in one prompt.
         prompt += (
             "\nAnswer from these sources, and say you do not have it rather than "
             "filling the gap yourself:\n"
@@ -225,6 +288,8 @@ def build_messages(
     language_code: str | None,
     context: str | None = None,
     memories: str | None = None,
+    stores: str | None = None,
+    discovery: bool = False,
     max_turns: int = 8,
 ) -> list[Message]:
     """System prompt, the recent past, then what was just said.
@@ -235,7 +300,10 @@ def build_messages(
     """
     recent = history[-(max_turns * 2) :] if max_turns > 0 else []
     return [
-        {"role": "system", "content": system_prompt(language_code, context, memories)},
+        {
+            "role": "system",
+            "content": system_prompt(language_code, context, memories, stores, discovery),
+        },
         *recent,
         {"role": "user", "content": transcript},
     ]

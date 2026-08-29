@@ -126,10 +126,15 @@ def gate_input(
     # Asking in English against a Hindi index used to abstain here, and that
     # was the gate contradicting the rest of the design. `multilingual-e5` was
     # chosen over a monolingual embedder precisely because it puts a question
-    # and its translation in the same region of the same space, and every chunk
-    # carries the original English MS MARCO passage beside the Indic one
-    # (docs/01-dataset.md). Both halves of a cross-lingual answer are already
+    # and its translation in the same region of the same space, and a chunk
+    # that carries its English original beside the indexed translation can be
+    # read back in either. Both halves of a cross-lingual answer are already
     # here; refusing on the strength of a language *label* threw them away.
+    #
+    # `indexed_languages` is empty for every caller in the app now: a connected
+    # store does not declare what languages it holds, and this app stopped
+    # holding a corpus it could ask. So the mismatch branch fires only on a
+    # language code that does not resolve at all.
     #
     # So a mismatch turns the language filter off and answers from the English
     # rendering, and the question of whether retrieval was actually good enough

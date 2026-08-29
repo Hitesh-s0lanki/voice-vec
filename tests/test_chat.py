@@ -19,6 +19,8 @@ from src.chat.store import (
     title_from,
 )
 from src.services.voice_service import VoiceSession, _Turn
+from src.tools.result import ToolResult
+from src.voice import llm
 
 
 class TestConversationId:
@@ -104,19 +106,38 @@ class FakeChat:
         return self.thread
 
 
+class FakeTools:
+    """A ToolCallStore that records instead of connecting."""
+
+    def __init__(self, *, configured: bool = True) -> None:
+        self.configured = configured
+        self.rows: list[dict] = []
+
+    def record(self, **fields):
+        self.rows.append(fields)
+
+
 class Row:
     def __init__(self, id: str, title: str | None = None, turns: int = 0) -> None:
         self.id, self.title, self.turns = id, title, turns
 
 
-def session(chat: FakeChat, owner: Owner, events: list) -> VoiceSession:
+def session(
+    chat: FakeChat, owner: Owner, events: list, tools: FakeTools | None = None
+) -> VoiceSession:
     async def emit(event):
         events.append(event)
 
     async def send_audio(chunk):  # never called by these tests
         raise AssertionError("no audio in this test")
 
-    return VoiceSession(emit=emit, send_audio=send_audio, owner=owner, chat=chat)
+    return VoiceSession(
+        emit=emit,
+        send_audio=send_audio,
+        owner=owner,
+        chat=chat,
+        tool_calls=tools or FakeTools(),
+    )
 
 
 def turn() -> _Turn:
@@ -305,3 +326,105 @@ class TestBind:
 
         assert voice.conversation_id is None
         assert events == []
+
+
+class TestToolCalls:
+    """What ran, said out loud and written down — and the two agreeing.
+
+    The panel draws a turn being spoken from the socket and the same turn read
+    back out of Postgres from `/conversations/{id}`. These are the assertions
+    that keep those two the same card.
+    """
+
+    def call(self) -> llm.ToolCall:
+        return llm.ToolCall(
+            id="call_1", name="GMAIL_SEND_EMAIL", arguments={"to": "a@b.c"}
+        )
+
+    def test_a_finished_call_is_announced_whole(self):
+        chat, tools, events = FakeChat(), FakeTools(), []
+        voice = session(chat, Owner(user_id="user_1"), events, tools)
+        voice.conversation_id = new_conversation_id()
+
+        async def run():
+            await voice._save_tool(
+                turn(),
+                self.call(),
+                ToolResult("GMAIL_SEND_EMAIL", ok=True, data={"id": "m1"}, ms=42.0),
+            )
+            await settle(voice)
+
+        asyncio.run(run())
+
+        announced = [event for event in events if event.type == "tool"]
+        assert len(announced) == 1
+        said = announced[0]
+        assert said.turn_id == "turn-1"
+        assert said.slug == "GMAIL_SEND_EMAIL"
+        assert said.toolkit == "gmail"
+        assert said.ok is True
+        # Both halves — the thread is unreadable with only the name.
+        assert said.arguments == {"to": "a@b.c"}
+        assert said.result == '{"id": "m1"}'
+        assert said.result_bytes == len('{"id": "m1"}')
+        assert said.latency_ms == 42.0
+
+    def test_the_row_is_written_under_the_id_that_was_announced(self):
+        """Otherwise a call already on screen arrives again on the next load."""
+        chat, tools, events = FakeChat(), FakeTools(), []
+        voice = session(chat, Owner(user_id="user_1"), events, tools)
+        voice.conversation_id = new_conversation_id()
+
+        async def run():
+            await voice._save_tool(
+                turn(), self.call(), ToolResult("GMAIL_SEND_EMAIL", ok=True, data={}, ms=1.0)
+            )
+            await settle(voice)
+
+        asyncio.run(run())
+
+        said = next(event for event in events if event.type == "tool")
+        assert len(tools.rows) == 1
+        assert tools.rows[0]["id"] == said.id
+        assert tools.rows[0]["turn_id"] == said.turn_id
+        assert tools.rows[0]["conversation_id"] == voice.conversation_id
+
+    def test_a_failure_travels_as_a_failure(self):
+        chat, tools, events = FakeChat(), FakeTools(), []
+        voice = session(chat, Owner(user_id="user_1"), events, tools)
+        voice.conversation_id = new_conversation_id()
+
+        async def run():
+            await voice._save_tool(
+                turn(),
+                self.call(),
+                ToolResult("GMAIL_SEND_EMAIL", ok=False, error="timed out", ms=9000.0),
+            )
+            await settle(voice)
+
+        asyncio.run(run())
+
+        said = next(event for event in events if event.type == "tool")
+        assert said.ok is False
+        assert said.status == "failed"
+        assert said.error == "timed out"
+        # `for_model` renders a failure as {"error": …}; storing that would be
+        # the error column said twice.
+        assert said.result is None
+        assert tools.rows[0]["result"] is None
+
+    def test_it_is_announced_with_no_database_behind_it(self):
+        """A session can still show what it just ran; it just cannot re-read it."""
+        chat, tools, events = FakeChat(), FakeTools(configured=False), []
+        voice = session(chat, Owner(user_id="user_1"), events, tools)
+
+        async def run():
+            await voice._save_tool(
+                turn(), self.call(), ToolResult("GMAIL_SEND_EMAIL", ok=True, data={}, ms=1.0)
+            )
+            await settle(voice)
+
+        asyncio.run(run())
+
+        assert len([event for event in events if event.type == "tool"]) == 1
+        assert tools.rows == []
