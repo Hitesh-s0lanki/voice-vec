@@ -2,8 +2,7 @@
 
 Every case here is one that produces *plausible* wrong output rather than an
 error: a sentence splitter that returns one giant Hindi sentence looks like bad
-recall, a provenance check that ignores merged origins looks like a broken
-retriever, and a grounding gate that passes a paraphrase looks like a working
+recall, and a grounding gate that passes a paraphrase looks like a working
 system right up until someone reads the answer.
 """
 
@@ -12,15 +11,7 @@ import os
 import pytest
 
 from src.core.config import Settings
-from src.rag.chunk import (
-    Origin,
-    Row,
-    content_key,
-    merge_duplicates,
-    normalise,
-    passage_atomic,
-    split_sentences,
-)
+from src.rag.chunk import normalise, split_sentences
 from src.rag.guardrails import gate_grounding, gate_input, gate_retrieval
 from src.rag.store import Hit
 from src.services.metrics_service import percentile
@@ -54,40 +45,6 @@ class TestSplitSentences:
 class TestNormalise:
     def test_collapses_whitespace(self):
         assert normalise("  a\n\n b  ") == "a b"
-
-    def test_nfc_makes_duplicates_hash_alike(self):
-        # क + nukta (combining) vs the precomposed क़ — the same grapheme.
-        combining = "क़"
-        precomposed = "क़"
-        assert content_key(combining) == content_key(precomposed)
-
-    def test_punctuation_is_ignored_for_dedup(self):
-        assert content_key("एक निगम है।") == content_key("एक निगम है")
-
-
-class TestProvenance:
-    def test_dedup_keeps_every_origin(self):
-        shared = "एक कंपनी एक विशिष्ट देश में निगमित होती है।"
-        first = Row(1, "DESCRIPTION", "q", "a", "hin_Deva", [shared], ["en"], [1])
-        second = Row(2, "NUMERIC", "q", "a", "hin_Deva", [shared], ["en"], [0])
-
-        merged = merge_duplicates(passage_atomic(first) + passage_atomic(second))
-
-        assert len(merged) == 1
-        # Both rows' labels survive: the same passage is gold for query 1 and
-        # not for query 2, and the scorer needs to know which query it is asking about.
-        assert merged[0].payload()["sourceQueryIds"] == [1, 2]
-        assert [o["isSelected"] for o in merged[0].payload()["origins"]] == [1, 0]
-
-    def test_passage_index_is_kept(self):
-        row = Row(7, "ENTITY", "q", "a", "hin_Deva", ["एक।", "दो।"], ["a", "b"], [0, 1])
-        chunks = passage_atomic(row)
-        assert [c.origins[0] for c in chunks] == [Origin(7, 0, 0), Origin(7, 1, 1)]
-
-    def test_blank_passages_are_dropped(self):
-        row = Row(1, "DESCRIPTION", "q", "a", "hin_Deva", ["", "  ", "ठीक।"], [], [])
-        assert len(passage_atomic(row)) == 1
-
 
 class TestGateInput:
     def test_short_transcript_is_refused(self):
@@ -260,8 +217,9 @@ class TestStore:
             store.pool
 
     def test_location_never_leaks_the_password(self):
-        """`location` reaches /health and the ingest log. Neon puts the
-        password in the DSN, so this is the one place it could escape."""
+        """`location` is what `describe()` puts in a trace and a log line, and
+        the DSN it is built from is *the user's*. Neon puts the password in
+        there, so this is the one place somebody else's could escape."""
         from src.core.config import Settings
         from src.rag.store import VectorStore
 
@@ -278,7 +236,17 @@ class TestStore:
     reason="needs a live Postgres with pgvector; set DATABASE_URL",
 )
 class TestStoreIntegration:
-    """Round-trips against a real database. Skipped without DATABASE_URL."""
+    """Round-trips against a real database. Skipped without DATABASE_URL.
+
+    The table is built here with raw DDL rather than by the store, because the
+    store has no DDL any more: every table it reads belongs to whoever
+    connected it (`src/rag/backends/pgvector.py`). Building one by hand is
+    therefore the accurate test — it is the shape a *connected* Postgres
+    arrives in, and it pins the one thing that still has to be right, which is
+    that the generated SQL finds the nearest row and honours its filters.
+    """
+
+    TABLE = "chunks_test"
 
     @pytest.fixture
     def store(self):
@@ -286,35 +254,53 @@ class TestStoreIntegration:
         from src.rag.store import VectorStore
 
         store = VectorStore(
-            Settings(database_url=os.environ["DATABASE_URL"], pg_table="chunks_test")
+            Settings(database_url=os.environ["DATABASE_URL"]), table=self.TABLE
         )
-        store.ensure_schema(4, recreate=True)
-        yield store
         with store.pool.connection() as conn, conn.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS chunks_test")
+            cur.execute(f"DROP TABLE IF EXISTS {self.TABLE}")
+            cur.execute(
+                f"""CREATE TABLE {self.TABLE} (
+                        chunk_key TEXT PRIMARY KEY,
+                        strategy  TEXT NOT NULL,
+                        language  TEXT NOT NULL,
+                        text      TEXT NOT NULL,
+                        embedding VECTOR(4) NOT NULL,
+                        meta      JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                        tsv       TSVECTOR GENERATED ALWAYS AS
+                                  (to_tsvector('simple', text)) STORED
+                    )"""
+            )
+            cur.execute(f"CREATE INDEX ON {self.TABLE} USING gin (tsv)")
+            conn.commit()
+
+        yield store
+
+        with store.pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(f"DROP TABLE IF EXISTS {self.TABLE}")
             conn.commit()
         store.close()
 
-    def _chunk(self, chunk_id, text):
-        from src.rag.chunk import Chunk, Origin
+    def _insert(self, store, rows):
+        """`(chunk_key, text, vector, language)` straight in, no upsert path."""
+        with store.pool.connection() as conn, conn.cursor() as cur:
+            cur.executemany(
+                f"""INSERT INTO {self.TABLE}
+                        (chunk_key, strategy, language, text, embedding)
+                    VALUES (%s, 'S1', %s, %s, %s)""",
+                [(key, language, text, vector) for key, text, vector, language in rows],
+            )
+            conn.commit()
 
-        return Chunk(
-            chunk_id=chunk_id,
-            strategy="S1",
-            text=text,
-            english=None,
-            language="hin_Deva",
-            query_type="DESCRIPTION",
-            origins=[Origin(query_id=7, passage_idx=0, is_selected=1)],
-        )
-
-    def test_upsert_then_search_returns_the_nearest(self, store):
+    def test_search_returns_the_nearest(self, store):
         import numpy as np
 
-        chunks = [self._chunk("a", "पहला"), self._chunk("b", "दूसरा")]
-        vectors = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32)
-        store.upsert(chunks, vectors)
-        store.create_indexes()
+        self._insert(
+            store,
+            [
+                ("a", "पहला", np.array([1, 0, 0, 0], np.float32), "hin_Deva"),
+                ("b", "दूसरा", np.array([0, 1, 0, 0], np.float32), "hin_Deva"),
+            ],
+        )
 
         hits = store.search(np.array([1, 0, 0, 0], np.float32), strategies=["S1"], limit=2)
 
@@ -324,40 +310,26 @@ class TestStoreIntegration:
         # scale, so an inverted sign abstains on everything.
         assert hits[0].score == pytest.approx(1.0, abs=1e-5)
 
-    def test_origins_survive_the_round_trip(self, store):
-        """evaluate.py scores recall off payload["origins"]; losing it turns
-        every correct retrieval into a miss."""
-        import numpy as np
-
-        store.upsert([self._chunk("a", "पहला")], np.array([[1, 0, 0, 0]], np.float32))
-        hit = store.search(np.array([1, 0, 0, 0], np.float32), strategies=["S1"], limit=1)[0]
-
-        assert hit.payload["origins"] == [
-            {"queryId": 7, "passageIdx": 0, "isSelected": 1}
-        ]
-        assert hit.payload["sourceQueryIds"] == [7]
-
-    def test_reingest_overwrites_rather_than_duplicating(self, store):
-        """The resume story: a crashed ingest re-runs by repeating itself."""
-        import numpy as np
-
-        vector = np.array([[1, 0, 0, 0]], np.float32)
-        store.upsert([self._chunk("a", "पहला")], vector)
-        store.upsert([self._chunk("a", "बदला हुआ")], vector)
-
-        assert store.count() == 1
-        hits = store.search(np.array([1, 0, 0, 0], np.float32), strategies=["S1"], limit=1)
-        assert hits[0].text == "बदला हुआ"
-
     def test_language_filter_excludes_other_languages(self, store):
         import numpy as np
 
-        chunk = self._chunk("a", "पहला")
-        store.upsert([chunk], np.array([[1, 0, 0, 0]], np.float32))
+        self._insert(store, [("a", "पहला", np.array([1, 0, 0, 0], np.float32), "hin_Deva")])
         query = np.array([1, 0, 0, 0], np.float32)
 
         assert store.search(query, strategies=["S1"], limit=1, language="hin_Deva")
         assert not store.search(query, strategies=["S1"], limit=1, language="tam_Taml")
+
+    def test_lexical_channel_finds_a_keyword(self, store):
+        import numpy as np
+
+        self._insert(store, [("a", "corporation law", np.array([1, 0, 0, 0], np.float32), "eng_Latn")])
+
+        hits = store.search_lexical("corporation", strategies=["S1"], limit=5)
+
+        assert [h.chunk_id for h in hits] == ["a"]
+
+    def test_an_empty_lexical_query_is_not_an_error(self, store):
+        assert store.search_lexical("   ", strategies=["S1"], limit=5) == []
 
 
 # ---- the effort ladder (docs/14-effort.md) ---------------------------------
@@ -446,8 +418,9 @@ class TestBackendCapabilities:
         for backend in (pinecone, astra):
             caps = backend.capabilities()
             assert caps.lexical is False
-            # Their metadata is somebody else's; the parallel English the
-            # cross-lingual answer path reads is written by this app's ingest.
+            # Their metadata is somebody else's, and the parallel English the
+            # cross-lingual answer path reads is a column a connected store has
+            # to carry — neither protocol has one to declare.
             assert caps.parallel_text is False
 
     def test_the_default_is_the_floor_not_the_typical_case(self):
@@ -877,7 +850,6 @@ def _ladder(store=None, cache=None, **overrides):
             return np.stack([self._vec(t) for t in texts])
 
     settings = Settings(
-        rag_enabled=True,
         database_url="postgresql://unused/x",
         # No provider keys: the upper rungs must degrade, not reach the network.
         openai_api_key="", sarvam_api_key="", llm_base_url="", llm_model="",
@@ -902,6 +874,59 @@ def _ask(service, effort, transcript="what is a corporation"):
     from src.schemas.ask import AskRequest
 
     return service.ask(AskRequest(transcript=transcript, effort=effort))
+
+
+class TestNothingConnected:
+    """The state every user starts in, now that there is no deployment corpus.
+
+    Two things have to be true at once: the pipeline must not 500 — a resolver
+    returning nothing is an ordinary state, not a bug — and it must not answer
+    either, because an answer with no source behind it is the failure the whole
+    extractive design exists to prevent.
+    """
+
+    def _service(self):
+        from src.rag.cache import AnswerCache
+        from src.services.ask_service import AskService
+        from src.services.metrics_service import MetricsService
+
+        class _NoBackend:
+            # `prefer` rides along since capability discovery can name a store
+            # (docs/23-capabilities.md); there is still nothing to return.
+            def for_user(self, user_id=None, *, prefer=None):
+                return None
+
+        settings = Settings(
+            openai_api_key="", sarvam_api_key="", llm_base_url="", llm_model="",
+            redis_url="",
+        )
+        return AskService(
+            settings,
+            _ladder()[0]._embedder,
+            _NoBackend(),
+            MetricsService(settings),
+            AnswerCache(settings),
+        )
+
+    def test_it_abstains_rather_than_failing(self):
+        response = _ask(self._service(), 1)
+
+        assert response.status == "abstained"
+        assert response.citations == []
+
+    def test_the_reason_names_what_is_missing(self):
+        """"Something went wrong on my side" would send somebody to the logs.
+        The fix is one tap away in the connectors panel, so say so."""
+        response = _ask(self._service(), 1)
+
+        assert "connect" in (response.reason or "").lower()
+
+    def test_it_is_recorded_as_an_escalation(self):
+        """`/metrics` has to be able to tell "nobody connected anything" apart
+        from "the corpus did not cover it" — they need different fixes."""
+        response = _ask(self._service(), 1)
+
+        assert "no-backend" in response.escalations
 
 
 class TestEffortLadder:
@@ -1009,8 +1034,8 @@ class TestLadderCache:
         assert cache.scopes == []
 
     def test_an_abstention_is_never_cached(self):
-        """It is a statement about the corpus at one moment. Cached, a re-ingest
-        that fills the gap stays invisible for the whole TTL."""
+        """It is a statement about the connected store at one moment. Cached,
+        a write that fills the gap stays invisible for the whole TTL."""
         cache = _RecordingCache()
         service, _ = _ladder(_FakeStore(scores=(0.61, 0.60, 0.60)), cache=cache)
         assert _ask(service, 1).status == "abstained"
@@ -1035,3 +1060,36 @@ class TestLadderCache:
         _query, scope, payload = cache.writes[0]
         assert scope.mode == "grounded"
         assert payload["answer"]
+
+
+class TestCacheWidth:
+    """The RediSearch index declares `DIM` once, at creation.
+
+    A user whose connected store was built by a 768-dimensional model produces
+    768-dimensional query vectors, and no version of that index holds both. The
+    semantic half is skipped for them; the exact half, which keys on the query
+    text, keeps working. `Scope` already separates their entries, so nothing is
+    mixed — what they lose is near-miss matching, which is a smaller loss than
+    a cache that logs a failure on every write.
+    """
+
+    def _cache(self, dim=384):
+        from src.core.config import get_settings
+        from src.rag.cache import AnswerCache
+
+        return AnswerCache(get_settings().model_copy(update={"embed_dim": dim}))
+
+    def test_a_matching_vector_fits(self):
+        import numpy as np
+
+        assert self._cache()._fits(np.zeros(384, dtype=np.float32))
+
+    def test_a_wider_vector_does_not(self):
+        import numpy as np
+
+        assert not self._cache()._fits(np.zeros(768, dtype=np.float32))
+
+    def test_a_narrower_vector_does_not_either(self):
+        import numpy as np
+
+        assert not self._cache(dim=768)._fits(np.zeros(384, dtype=np.float32))

@@ -200,8 +200,8 @@ everything Tier 3 — LLM synthesis, tool calls, Gate 4.
 ## Running the whole thing
 
 ```bash
-# once — build the index (~12 min, 19,870 chunks)
-uv run python -m scripts.ingest --rows 2000 --recreate
+# once — this app's own tables (conversations, connectors, profiles, datasets)
+uv run python -m scripts.migrate
 
 # terminal 1 — the pipeline
 uv run python -m src.main            # 127.0.0.1:8001
@@ -210,25 +210,24 @@ uv run python -m src.main            # 127.0.0.1:8001
 cd frontend && npm run dev           # localhost:3002
 ```
 
-Embedded Qdrant is **single-writer**: the ingest, the evaluation and the API each want the
-same lock, so run them one at a time. `QDRANT_URL` points all three at a Qdrant server
-instead, and then they can run together.
+There is no index to build first. This app holds no corpus: a question is answered from the
+vector store its asker connected in the connectors panel — Pinecone, Astra, or their own
+Postgres — and a user with nothing attached gets *"I don't have a source to search yet"*
+rather than an answer from somewhere else. See [13-connectors.md](13-connectors.md).
 
-Check the wiring without a microphone: `GET /health` reports the embedder, the chunk count
-and what the last ingest built; `GET /metrics` reports live percentiles per stage.
+Check the wiring without a microphone: `GET /health` reports the process and the embedder,
+and `GET /connectors` — under a signed-in identity — reports which store is answering that
+user. `GET /metrics` reports live percentiles per stage, and `by_backend` says which stores
+the buffered requests were served from.
 
 ## Knowing what to ask
 
-The index answers ~2,000 specific MS MARCO questions and abstains on everything else, which
-is correct behaviour that reads as breakage when you have no idea what is in there. Ask it
-"what is corruption?" and it will honestly tell you it has nothing — the corpus contains
-five passing mentions of भ्रष्टाचार and no definition.
+A connected store answers what is in it and abstains on everything else, which is correct
+behaviour that reads as breakage when you have no idea what is in there. This used to be
+answered by a deployment-wide list of openers, generated against the one corpus this app
+held; with retrieval per-user that list has no single subject and it is gone.
 
-So [`scripts/suggestions.py`](../scripts/suggestions.py) runs candidate questions from the
-corpus through the live pipeline and keeps only those that come back `answered`;
-`GET /suggestions` serves them, and [`try-asking.tsx`](../frontend/src/components/try-asking.tsx)
-offers them under the orb — at rest, and again after any question that didn't land. Tapping
-one runs the identical `/api/ask` path a spoken question does.
-
-Regenerate after every re-ingest: the thresholds move with the index, and a suggestion that
-abstains is worse than none.
+What replaced it is per-store and per-user: connecting a store profiles it, and the
+resulting card — *what it holds, what it is good for, what may be filtered* — is shown in
+the connectors panel and fed to the router as the description it routes on
+([17-understanding.md](17-understanding.md)).

@@ -46,7 +46,7 @@ a Redis instance is a place other things also live.
 **Two rules that make this safe rather than merely fast.**
 
 *Only successes are cached.* An abstention is a statement about the corpus at
-one moment; cache it and a re-ingest that fixes the gap is invisible for a day.
+one moment; cache it and a write that fills the gap is invisible for a day.
 A refusal is a statement about the input and is cheap to recompute anyway.
 
 *The threshold is high and the scope is narrow.* A cache that answers a
@@ -265,7 +265,27 @@ class AnswerCache:
             log.debug("cache semantic lookup failed: %s", error)
             return None
 
+    def _fits(self, vector: np.ndarray) -> bool:
+        """Is this vector the width the index was created at?
+
+        The RediSearch index is declared `DIM = embed_dim` once, at creation.
+        A user whose connected store was built by a 768-dimensional model gets
+        768-dimensional query vectors, and there is no version of this index
+        that holds both — so the semantic half is skipped for them and the
+        exact half, which keys on the query text, keeps working.
+
+        Silently, and correctly: `Scope` already separates their entries from
+        everybody else's, so nothing is mixed. What they lose is near-miss
+        matching, which is a smaller loss than a cache that raises on every
+        write. Rebuilding the index per width would mean one index per model
+        per deployment, for a saving that is already the smaller half.
+        """
+        return int(np.asarray(vector).size) == self._settings.embed_dim
+
     def _nearest(self, client: Any, vector: np.ndarray, scope_key: str) -> Hit | None:
+        if not self._fits(vector):
+            return None
+
         reply = client.execute_command(
             "FT.SEARCH", self.index_name,
             f"(@scope:{{{scope_key}}})=>[KNN 1 @vector $v AS dist]",
@@ -326,7 +346,13 @@ class AnswerCache:
         try:
             pipe = client.pipeline(transaction=False)
 
-            if not self._semantic:
+            # Exact-only when there is no query engine, and equally when this
+            # vector is not the width the index was declared at — writing a
+            # 768-dimensional vector into a 384-dimensional index is rejected
+            # per entry, which would turn every write for that user into a
+            # logged failure for a cache that could still serve them on the
+            # exact path.
+            if not self._semantic or not self._fits(vector):
                 pipe.setex(self._exact_key(scope_key, query), ttl, body)
                 pipe.execute()
                 return

@@ -18,7 +18,7 @@ class AskRequest(Wire):
         default=None, description="Sarvam's detected language, e.g. hi-IN"
     )
     effort: int = Field(
-        default=1,
+        default=2,
         ge=0,
         le=4,
         description=(
