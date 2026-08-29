@@ -4,11 +4,15 @@ Design docs for the HH Goa 2026 Task 2 submission.
 
 > **Both halves run now.** [11-voice.md](11-voice.md) is the spoken loop — speak in any of
 > 22 languages, be answered out loud in the same one, every stage streaming into the next.
-> Retrieval is on behind it over 19,870 Hindi passages, and answers questions asked in any
-> language ([13-cross-lingual.md](13-cross-lingual.md)).
+> Retrieval is on behind it, and answers questions asked in any language
+> ([13a-cross-lingual.md](13a-cross-lingual.md)).
 >
-> Two caveats documents 01–10 do not yet reflect: the index moved from embedded Qdrant to
-> Postgres + pgvector, and with it a round trip away the **200 ms budget in
+> Three caveats documents 01–10 do not yet reflect. **There is no deployment corpus any
+> more** — the `chunks` table those documents describe, and the ingest that built it, are
+> gone; a question is answered from the vector store its asker connected
+> ([22-no-local-corpus.md](22-no-local-corpus.md), [13-connectors.md](13-connectors.md)).
+> The index that did exist had moved from embedded Qdrant to Postgres + pgvector, and with
+> a connected store a round trip away the **200 ms budget in
 > [04-latency.md](04-latency.md) no longer holds** — search alone costs ~400 ms. That
 > budget was measured in-process and remains the target, not a claim about today.
 
@@ -52,11 +56,18 @@ a measured number on thousands of queries rather than a demo that worked once.
 10. **[10-request-flow.md](10-request-flow.md)** — the wired path, mic to rendered answer
 11. **[11-voice.md](11-voice.md)** — the spoken loop that ships today: streaming, languages, barge-in
 12. **[12-conversations.md](12-conversations.md)** — where a turn goes after it is heard: the two tables, who owns one, and `/c/{id}`
-13. **[13-cross-lingual.md](13-cross-lingual.md)** — asking in a language the index does not hold: what it costs, measured, and the two thresholds it needs
 13. **[13-connectors.md](13-connectors.md)** — the services a user attaches with their own credentials: Composio for tools, Pinecone/Astra/pgvector for where their questions get answered
+13a. **[13a-cross-lingual.md](13a-cross-lingual.md)** — asking in a language the index does not hold: what it costs, measured, and the two thresholds it needs
 14. **[14-glass.md](14-glass.md)** — the interface's one surface vocabulary: the ambient room glass needs to be visible in, the nine surfaces, and the two hover directions
 15. **[15-effort.md](15-effort.md)** — the effort slider as five retrieval architectures: what each rung runs, the Redis answer cache, and why the level is a ceiling rather than a floor
 16. **[16-memory.md](16-memory.md)** — what the agent knows before you speak: Redis Agent Memory, why Postgres stays the source of truth, and how two features share one 30 MB instance
+17. **[17-understanding.md](17-understanding.md)** — what the agent knows about a store it just connected: coverage instead of presence, why `filters=True` was a guess, and the two failures that had no symptom
+18. **[18-datasets.md](18-datasets.md)** — attaching a dataset by URL and answering it in SQL: why the data is copied locally, the sealed DuckDB the generated SQL runs in, and the one column that was 96% of a 470 MB file
+19. **[19-responsive.md](19-responsive.md)** — the stage on a phone and a tablet: why the layout turns on `lg` rather than `md`, the centred sheet the rail panels open into, the activity drawer, and the one breakpoint that measures height
+20. **[20-composio-gateway.md](20-composio-gateway.md)** — Composio on either of its two credentials: the platform SDK, the MCP gateway, and the one call shape that works on both
+21. **[21-agents.md](21-agents.md)** — one package for the agents, one contract under them, and LangChain under that: what counts as an agent here, the three promises `BaseAgent` holds, the one real tool loop, and the prompt files in [`src/prompts/`](../src/prompts/), and the tools in [`src/tools/`](../src/tools/)
+22. **[22-no-local-corpus.md](22-no-local-corpus.md)** — removing the deployment's own index: what a fallback corpus was hiding, why "nothing connected" is an answer rather than an error, and everything that came out with it
+23. **[23-capabilities.md](23-capabilities.md)** — what the agent can reach, as a tool instead of a prompt: `find_capability` searches the measured cards, and what it names unlocks the tool that acts on it
 
 ## Background research
 
@@ -90,14 +101,18 @@ Built and working:
   Composio for tools, Pinecone/Astra/pgvector for retrieval
   ([13-connectors.md](13-connectors.md)): [`src/connectors/`](../src/connectors/),
   [`src/rag/backends/`](../src/rag/backends/)
-- S1 index over 2,000 `hinval` rows, local ONNX embedding, Postgres + pgvector, extractive
-  answers, Gates 1–3, per-stage timings, live percentiles at `GET /metrics`
-- Cross-lingual retrieval — a question in any language against the Hindi index, answered
-  from the English original each chunk carries, with its own measured thresholds
-  ([13-cross-lingual.md](13-cross-lingual.md))
+- Composio reachable on either of its two credentials — a platform `ak_` key through the
+  SDK, an MCP gateway `ck_` key through JSON-RPC
+  ([20-composio-gateway.md](20-composio-gateway.md)): [`src/integrations/mcp.py`](../src/integrations/mcp.py)
+- Retrieval against a *connected* store only — local ONNX embedding, extractive answers,
+  Gates 1–3, per-stage timings, live percentiles at `GET /metrics`. Nothing is ingested
+  here and nothing falls back to a shared index ([22-no-local-corpus.md](22-no-local-corpus.md))
+- Cross-lingual retrieval — a question in any language against a store indexed in another,
+  answered from the English original a chunk carries, with its own measured thresholds
+  ([13a-cross-lingual.md](13a-cross-lingual.md))
 
 Not built yet: S2–S5 and hybrid retrieval (requirement 2's heavy half), Tier 2 rerank,
-Tier 3 LLM synthesis with Gate 4, and the full-corpus ingest.
+Tier 3 LLM synthesis with Gate 4.
 
 ## A note on numbers in these docs
 

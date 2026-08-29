@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 
 from src.chat.store import ChatStore, Conversation, Message, Owner, get_chat_store
-from src.chat.tools import ToolCallRow, ToolCallStore, get_tool_call_store
+from src.chat.tool_calls import ToolCallRow, ToolCallStore, get_tool_call_store
 from src.core.db import DatabaseUnavailable
 from src.schemas.chat import (
     ChatMessage,
@@ -60,6 +60,7 @@ def tool_to_wire(row: ToolCallRow) -> ToolCall:
         status=row.status,
         ok=row.ok,
         error=row.error,
+        result=row.result,
         result_bytes=row.result_bytes,
         latency_ms=row.latency_ms,
         created_at=row.created_at,

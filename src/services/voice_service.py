@@ -48,8 +48,21 @@ from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable
 
 import anyio
 
-from src.chat.tools import ToolCallStore, get_tool_call_store
-from src.integrations.agent import ToolAgent, get_agent
+from src.chat.tool_calls import (
+    ToolCallStore,
+    get_tool_call_store,
+    new_tool_call_id,
+    toolkit_of,
+    trim,
+    trim_result,
+)
+from src.connectors.profile_service import get_profile_service
+from src.datasets.service import get_dataset_service
+from src.tools.capabilities import CapabilityTools, get_capability_tools
+from src.tools.dataset import DatasetTools, get_dataset_tools
+from src.tools.kit import ToolKit
+from src.tools.store import StoreTools, get_store_tools
+from src.agents.tool_agent import ToolAgent, get_agent
 from src.chat.store import (
     ChatStore,
     Owner,
@@ -188,6 +201,11 @@ class VoiceSession:
     #: What the agent may run, and where the record of it goes. Both are
     #: no-ops for a session whose owner has linked nothing.
     agent: ToolAgent = field(default_factory=get_agent)
+    datasets: DatasetTools = field(default_factory=get_dataset_tools)
+    #: Discovery, and the store search it unlocks. Together with the two above
+    #: they are what a turn may call — assembled per turn by `ToolKit`.
+    capabilities: CapabilityTools = field(default_factory=get_capability_tools)
+    stores: StoreTools = field(default_factory=get_store_tools)
     tool_calls: ToolCallStore = field(default_factory=get_tool_call_store)
     #: What the agent remembers from *other* conversations. A no-op for a
     #: deployment with no Agent Memory service — see `src/memory/store.py`.
@@ -203,8 +221,8 @@ class VoiceSession:
     def describe(self) -> events.Ready:
         """What this session can actually do, said up front."""
         # Imported here rather than at module scope for the same reason the
-        # rest of the RAG stack is: a checkout with retrieval off should not
-        # pay for it at import time.
+        # rest of the RAG stack is: nothing in a describe() should pull the
+        # retrieval half of the app in at import time.
         from src.rag.cache import get_cache
 
         target = self.settings.resolve_llm()
@@ -217,7 +235,6 @@ class VoiceSession:
                 llm=target.provider if target.ready else None,
                 llm_model=target.model if target.ready else None,
                 tts=("sarvam" if self.settings.sarvam_ready else "openai") if speaks else None,
-                rag_enabled=self.settings.rag_enabled,
                 effort_max=self.settings.effort_max,
                 cache=get_cache().describe(),
                 memory=self.memory.describe(),
@@ -605,10 +622,12 @@ class VoiceSession:
             # before. `_recall` adds no new way for a turn to fail: its lookup
             # swallows everything, and the only thing left in it that can throw
             # is the same `_say` every other stage already calls.
-            context, memories = await asyncio.gather(
+            context, memories, reach = await asyncio.gather(
                 self._retrieve(question, turn),
                 self._recall(question, turn),
+                self._stores(),
             )
+            stores, discovery = reach
 
             messages = llm.build_messages(
                 transcript=question,
@@ -616,6 +635,8 @@ class VoiceSession:
                 language_code=turn.language_code,
                 context=context,
                 memories=memories,
+                stores=stores,
+                discovery=discovery,
                 max_turns=self.settings.llm_history_turns,
             )
 
@@ -691,14 +712,28 @@ class VoiceSession:
         if not self.settings.tools_enabled or not self.owner.user_id:
             return messages
 
-        tools = await anyio.to_thread.run_sync(self.agent.tools_for, self.owner.user_id)
-        if not tools:
-            return messages
+        # One kit per turn: what is callable *now*, which grows as discovery
+        # names things (`src/tools/kit.py`). Round 1 offers `find_capability`
+        # and nothing else; the mailbox, the store and the dataset appear only
+        # once a search has said they are relevant.
+        kit = ToolKit(
+            capabilities=self.capabilities,
+            stores=self.stores,
+            datasets=self.datasets,
+            composio=self.agent,
+            settings=self.settings,
+        )
 
         working = list(messages)
         ran = 0
 
         for round_number in range(self.settings.tool_max_rounds):
+            # Off the loop: the miss path reads Postgres, and on the second
+            # round it fetches the schemas discovery just unlocked.
+            tools = await anyio.to_thread.run_sync(kit.schemas, self.owner.user_id)
+            if not tools:
+                return working if ran else messages
+
             try:
                 completion = await llm.complete(
                     working, settings=self.settings, tools=tools
@@ -754,7 +789,7 @@ class VoiceSession:
 
             for call in completion.tool_calls:
                 ran += 1
-                result = await self._run_tool(turn, call)
+                result = await self._run_tool(turn, call, kit)
                 working.append(
                     {
                         "role": "tool",
@@ -765,28 +800,27 @@ class VoiceSession:
 
         return working
 
-    async def _run_tool(self, turn: _Turn, call: "llm.ToolCall"):
+    async def _run_tool(self, turn: _Turn, call: "llm.ToolCall", kit: ToolKit):
         """One tool: run it, tell the client, write it down.
 
         Off the event loop, and with a ceiling on it. A tool that has not
         answered inside `tool_timeout_s` is costing the listener more than it
         is worth, so the turn continues and the model is told it timed out —
         which it can say out loud, unlike a silence.
+
+        Which executor runs it is `ToolKit`'s to decide, and so is what a
+        discovery unlocks for the next round — this half only has to be the
+        part that takes time, tells the client and writes the row.
         """
         assert self.owner.user_id is not None
 
         try:
             with anyio.fail_after(self.settings.tool_timeout_s):
                 result = await anyio.to_thread.run_sync(
-                    partial(
-                        self.agent.execute,
-                        self.owner.user_id,
-                        call.name,
-                        call.arguments,
-                    )
+                    partial(kit.execute, self.owner.user_id, call.name, call.arguments)
                 )
         except TimeoutError:
-            from src.integrations.agent import ToolResult
+            from src.tools.result import ToolResult
 
             result = ToolResult(
                 call.name,
@@ -804,30 +838,69 @@ class VoiceSession:
             detail=None if result.ok else (result.error or "failed"),
             ms=turn.mark(),
         )
-        self._save_tool(turn, call, result)
+        await self._save_tool(turn, call, result)
         return result
 
-    def _save_tool(self, turn: _Turn, call: "llm.ToolCall", result) -> None:
-        """Record the call, eventually — on the same queue as the messages.
+    async def _save_tool(self, turn: _Turn, call: "llm.ToolCall", result) -> None:
+        """Say what ran, then write it down — in that order, on purpose.
 
-        The result is measured, not stored: see `src/chat/tools.py` for why an
-        audit table should not become a copy of everything the agent has read.
+        Both halves go down: the arguments the agent chose, and the head of what
+        came back. The store bounds the second one and keeps `result_bytes` as
+        the size of the whole — see `src/chat/tool_calls.py` for why the preview is
+        the containment rather than an omission.
+
+        A failure stores no preview. `for_model` renders one as `{"error": …}`,
+        which is the error column said twice.
+
+        The frame is built from the *bounded* values, not the raw ones, so the
+        card drawn from this event and the card drawn from the row a reload
+        fetches are the same card. It goes out immediately while the row rides
+        the writer queue: the client is waiting and the database is not on the
+        turn's path, and minting the id here is what lets the two be recognised
+        as one call when the stored thread arrives later.
+
+        Announced even with no database configured. A session can still show
+        what it just ran; what it loses is reading it back tomorrow.
         """
+        rendered = result.for_model() if result.ok else ""
+        call_id = new_tool_call_id()
+        arguments = trim(call.arguments or {})
+        # Cut to the column's own width here rather than only on the way into
+        # Postgres: a provider error is somebody else's string, and the event
+        # and the row have to say the same thing about the same call.
+        failure = None if result.ok else (str(result.error)[:500] if result.error else None)
+
+        await self.emit(
+            events.ToolEvent(
+                id=call_id,
+                turn_id=turn.id,
+                toolkit=toolkit_of(call.name),
+                slug=call.name,
+                arguments=arguments,
+                status="ok" if result.ok else "failed",
+                ok=result.ok,
+                error=failure,
+                result=trim_result(rendered),
+                result_bytes=len(rendered) if rendered else None,
+                latency_ms=result.ms,
+            )
+        )
+
         if not self.tool_calls.configured:
             return
-
-        rendered = result.for_model() if result.ok else ""
 
         self._enqueue(
             partial(
                 self.tool_calls.record,
+                id=call_id,
                 slug=call.name,
                 status="ok" if result.ok else "failed",
                 conversation_id=self.conversation_id,
                 turn_id=turn.id,
                 user_id=self.owner.user_id,
-                arguments=call.arguments,
-                error=None if result.ok else result.error,
+                arguments=arguments,
+                error=failure,
+                result=rendered or None,
                 result_bytes=len(rendered) if rendered else None,
                 latency_ms=result.ms,
             )
@@ -1035,12 +1108,75 @@ class VoiceSession:
             )
         return rendered
 
-    async def _retrieve(self, question: str, turn: _Turn) -> str | None:
-        """The RAG seam. Returns None while `RAG_ENABLED` is false.
+    async def _stores(self) -> tuple[str | None, bool]:
+        """What this listener can reach — as counts, not as descriptions.
 
-        This is the whole switch: with retrieval on, the corpus passages become
-        the context the reply is grounded in and the guardrails in
-        `src/rag/guardrails.py` decide whether there is an answer at all.
+        The descriptions used to be here, one card per connected store and
+        dataset, read into every prompt whether or not the question was about
+        any of them. They now sit behind `find_capability`
+        (docs/23-capabilities.md), and what is left is the one fact the model
+        cannot discover on its own: that there is something to discover.
+
+        Returns `(text, discovery)`. `discovery` says which shape the text is
+        in, because the two need different instructions after them — counts
+        need "go and look", cards do not.
+
+        **The cards come back when discovery cannot run.** Profiling off, a
+        store connected thirty seconds ago, capabilities switched off: the old
+        block is better than nothing, and nothing is what a counts line means
+        to a model with no tool to follow it up with.
+
+        Third in the gather rather than fetched earlier, and `None` on every
+        failure. A turn whose profile lookup is slow or broken is a turn that
+        answers without knowing what it could have searched — which is exactly
+        how every turn behaved before this existed.
+        """
+        user_id = self.owner.user_id
+        if not user_id or not self.settings.profile_enabled:
+            return None, False
+
+        if self.settings.capabilities_enabled:
+            try:
+                found = await anyio.to_thread.run_sync(
+                    partial(self.capabilities.available, user_id)
+                )
+            except Exception as error:
+                log.debug("could not read capabilities: %s", error)
+                found = []
+            if found:
+                return _reach(found), True
+
+        try:
+            connectors, datasets = await asyncio.gather(
+                anyio.to_thread.run_sync(partial(get_profile_service().cards, user_id)),
+                anyio.to_thread.run_sync(partial(get_dataset_service().cards, user_id)),
+            )
+        except Exception as error:
+            log.debug("could not read connector or dataset profiles: %s", error)
+            return None, False
+
+        # Stores first, then datasets. An agent scanning this is answering two
+        # questions — "where do I look" and "what can I count" — and the second
+        # is answered by a tool call rather than by retrieval, so it reads last.
+        blocks = [block for block in (connectors, datasets) if block]
+        return ("\n\n".join(blocks) or None), False
+
+    async def _retrieve(self, question: str, turn: _Turn) -> str | None:
+        """The RAG seam. Returns None when this listener has nothing to search.
+
+        Passages become the context the reply is grounded in, and the
+        guardrails in `src/rag/guardrails.py` decide whether there is an answer
+        at all.
+
+        What decides whether this runs is the *asker*, not the deployment.
+        There used to be a process-wide switch here, from when there was a
+        corpus behind this app to switch on; there is not one any more, and a
+        question can only be retrieved for if its asker attached a vector store
+        (docs/13-connectors.md). So the resolver is asked first, and nobody who
+        has attached nothing pays for a pipeline whose only possible outcome is
+        "I don't have a source to search yet" — said out loud, on every turn,
+        including "hello". Their turns are answered by the model and by
+        whatever tools they *have* connected, which is what they were before.
 
         How hard it works is the turn's own effort level (docs/15-effort.md).
         Rung 0 hands back passages, rung 1 an extracted span, rungs 2 and up an
@@ -1049,21 +1185,22 @@ class VoiceSession:
         The voice model still writes what is said, because it is the half that
         knows the language, the history and how a sentence sounds out loud.
         """
-        if not self.settings.rag_enabled:
-            await self._say(
-                turn,
-                "retrieval",
-                "skipped",
-                "Retrieval is off — answering from the model",
-                ms=turn.mark(),
-            )
-            return None
-
         import anyio
 
         from src.rag import effort as rungs
+        from src.rag.backends.resolve import get_resolver
         from src.schemas.ask import AskRequest
         from src.services.ask_service import get_ask_service
+
+        # Off the loop: the miss path reads Postgres. Cached per user behind
+        # the sealed credential blob, so this is a dictionary lookup on every
+        # turn after the first — and it is the same resolver `ask` will use, so
+        # the two cannot disagree about whether there is somewhere to look.
+        store = await anyio.to_thread.run_sync(
+            partial(get_resolver().for_user, self.owner.user_id)
+        )
+        if store is None:
+            return None
 
         level = self.settings.effort_level(turn.effort)
         await self._say(
@@ -1077,8 +1214,8 @@ class VoiceSession:
 
         service = get_ask_service()
         # Off the event loop, and with the account attached: a user who
-        # connected Pinecone is searched against theirs, everybody else against
-        # the deployment's store (docs/13-connectors.md).
+        # connected Pinecone is searched against theirs, and a user who
+        # connected nothing is told so (docs/13-connectors.md).
         answer = await anyio.to_thread.run_sync(
             partial(service.ask, user_id=self.owner.user_id),
             AskRequest(
@@ -1190,3 +1327,27 @@ class VoiceSession:
 
 def get_voice_session(emit: Emit, send_audio: SendAudio) -> VoiceSession:
     return VoiceSession(emit=emit, send_audio=send_audio, settings=get_settings())
+
+
+def _reach(found: "list") -> str:
+    """The counts line: how much of each kind, and nothing about any of it.
+
+    Deliberately not a list of names. A name is a hint, and a model given
+    hints starts routing on them — "you have a students dataset" is enough for
+    it to answer a question about students without ever querying one. The
+    tool is the only way to learn what anything holds, so the prompt says only
+    that the tool has something to find.
+    """
+    from src.capabilities.catalogue import DATASET, STORE, TOOLKIT
+
+    labels = [
+        (STORE, "connected store", "connected stores"),
+        (DATASET, "dataset", "datasets"),
+        (TOOLKIT, "connected account", "connected accounts"),
+    ]
+    parts = []
+    for kind, one, many in labels:
+        n = sum(1 for c in found if c.kind == kind)
+        if n:
+            parts.append(f"{n} {one if n == 1 else many}")
+    return ", ".join(parts) + "." if parts else ""
