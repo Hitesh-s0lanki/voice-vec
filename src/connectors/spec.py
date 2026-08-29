@@ -10,14 +10,18 @@ The alternative, a React component per service, means every new connector
 touches two languages and two review cycles, and means the form and the
 validation drift apart the first time somebody edits one of them.
 
-Two kinds so far:
+Three kinds so far:
 
     tools    Composio — things the user can act through
     vector   Pinecone, Astra, pgvector — where their embeddings live
+    dataset  a URL to parquet or CSV, pulled local and answered in SQL
 
 `kind` is not decoration. It is what lets the retrieval path ask "which vector
 store belongs to this user" without enumerating slugs, so a fourth vector
-backend does not require editing the code that chooses between them.
+backend does not require editing the code that chooses between them — and it is
+what keeps `dataset` out of that question entirely. A dataset is not searched
+and has no backend under `src/rag/backends/`; it is queried through a tool
+(docs/18-datasets.md), so the code that picks a store must never see it.
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Literal, Mapping
 
-Kind = Literal["tools", "vector"]
+Kind = Literal["tools", "vector", "dataset"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +80,13 @@ class ConnectorSpec:
     # anything is written down: a credential that cannot answer one cheap call
     # is not worth encrypting and keeping, and finding out at connect time is
     # one clear message instead of every later action failing opaquely.
-    verify: Callable[[Mapping[str, str]], None]
+    #
+    # May also *resolve* a value the user left blank, by returning the fields
+    # to merge before sealing. That is not scope creep: the only way to know
+    # which table on somebody's Postgres holds vectors is to look, and looking
+    # is what this call already does. Returning `None` — what three of the four
+    # do — means the submitted values stand as typed.
+    verify: Callable[[Mapping[str, str]], Mapping[str, str] | None]
     docs_url: str = ""
     # Which field's last four characters identify this connection in the UI.
     # Defaults to the first secret field, which is right for all four today.

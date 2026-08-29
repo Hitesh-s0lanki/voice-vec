@@ -156,7 +156,13 @@ class ConnectorService:
             )
 
         values = spec.clean(submitted)
-        spec.verify(values)  # raises ConnectorError; nothing written yet
+
+        # Raises `ConnectorError`; nothing written yet. A connector that had to
+        # look something up in order to verify hands it back here rather than
+        # making the user type what the server already found.
+        resolved = spec.verify(values)
+        if resolved:
+            values.update({k: v for k, v in resolved.items() if v})
 
         try:
             sealed = self._sealed.seal_map(values)
@@ -175,10 +181,17 @@ class ConnectorService:
         person recognises which connection this is — and the secret one reduced
         to four characters, which distinguishes two keys and reconstructs
         neither.
+
+        The four-character digest is only produced for a *secret* source. When
+        a connector hints from a public field the whole value is already in
+        `hints` above, so a truncation of it adds nothing and reads as damage:
+        the `dataset` connector hinting from its URL produced
+        `url_hint: "tion"` — the tail of "validation" — sitting beside the full
+        URL it came from.
         """
         hints = {name: values[name] for name in spec.public_fields if name in values}
         source = spec.hint_source
-        if source and source in values:
+        if source and source in values and source in spec.secret_fields:
             hints[f"{source}_hint"] = hint(values[source])
         return hints
 

@@ -82,13 +82,6 @@ class Settings(BaseSettings):
     # more only buys buffer nobody hears.
     speech_lookahead: int = 2
 
-    # ---- Retrieval (off) ------------------------------------------------
-    # The RAG pipeline below is built and tested but switched off: the voice
-    # loop answers conversationally for now. Turn this on and /ask comes back
-    # and each spoken turn gets grounded in the corpus first — see
-    # `VoiceService._retrieve`. Everything downstream of it already exists.
-    rag_enabled: bool = False
-
     # ---- Clerk (src/core/clerk.py) --------------------------------------
     # Who a caller is, when they are signed in. The browser opens the voice
     # socket against this server directly, so identity arrives as a Clerk
@@ -147,7 +140,7 @@ class Settings(BaseSettings):
     # and evicting one hands those connections back.
     vector_backend_cache: int = 16
 
-    # ---- Tool calling (src/integrations/agent.py) ------------------------
+    # ---- Tool calling (src/agents/tool_agent.py) -------------------------
     # A spoken turn can run the tools a user has linked through Composio. The
     # whole feature is skipped for anybody who has linked nothing, so these
     # only bite once somebody has.
@@ -191,28 +184,161 @@ class Settings(BaseSettings):
     embed_threads: int | None = None
     embed_cache_dir: str = "data/models"
 
-    # ---- Vector store (Postgres + pgvector) -----------------------------
-    # Neon, or any Postgres with the `vector` extension available. Use the
-    # *pooled* endpoint (the host carrying `-pooler`) — the store disables
-    # prepared statements for it, and a direct endpoint exhausts its connection
-    # limit under the API's pool.
+    # ---- Postgres (src/core/db.py) --------------------------------------
+    # This app's own database: conversations, tool calls, connected accounts,
+    # what was profiled about them, and the datasets somebody attached. Not a
+    # corpus — there is no chunk table here any more, and nothing this app owns
+    # is searched. Retrieval reads the vector store its asker connected
+    # (docs/13-connectors.md).
     #
-    # Region matters to the SLO, not just to comfort: search measured ~11 ms
-    # in-process, and every millisecond of round trip is spent inside the same
-    # 200 ms as extraction's 78 ms (docs/04-latency.md). Keep the database in
-    # the region the API runs in.
+    # Neon, or any Postgres. Use the *pooled* endpoint (the host carrying
+    # `-pooler`) — the pool disables prepared statements for it, and a direct
+    # endpoint exhausts its connection limit under the API's.
+    #
+    # Region matters to the SLO, not just to comfort: every millisecond of
+    # round trip is spent inside the same 200 ms as extraction's 78 ms
+    # (docs/04-latency.md). Keep the database in the region the API runs in.
     database_url: str = ""
-    pg_table: str = "chunks"
     pg_pool_min: int = 1
     pg_pool_max: int = 8
     pg_connect_timeout_s: float = 10.0
     # A query that outlives the 200 ms deadline is already lost; the ceiling is
-    # generous because ingest shares the pool and legitimately runs longer.
+    # generous because a dataset build shares the pool and legitimately runs
+    # longer.
     pg_statement_timeout_ms: int = 5000
-    # HNSW search breadth. Below `search_limit` the index cannot return a full
-    # page, so the store raises it to match. Higher trades latency for recall
-    # and is the first dial to turn if recall@5 drops after the migration.
+    # HNSW search breadth, set on every pooled connection — including the
+    # private pools opened against a *connected* Postgres, which is now the
+    # only place a vector search happens. Below `search_limit` the index cannot
+    # return a full page, so it is raised to match. Higher trades latency for
+    # recall, and is the first dial to turn if recall@5 looks thin.
     hnsw_ef_search: int = 64
+
+    # ---- Connector profiling (docs/17-understanding.md) ------------------
+    # Connecting a store proves a credential works and says nothing about what
+    # is in it. Profiling closes that gap: a probe samples the connected store,
+    # a model names what it holds, and the result is stored so every later turn
+    # reads a paragraph instead of a round trip.
+    profile_enabled: bool = True
+    # Whether a few short passages of the user's own data may be sent to the
+    # model that writes the summary. Off keeps the profile to measurements —
+    # counts, fields, coverage — which still drives capability detection and
+    # only costs the routing hints. This is a disclosure, so it is a setting.
+    profile_excerpts: bool = True
+    profile_narrate: bool = True
+    # How long an understanding is trusted before a refresh is scheduled behind
+    # it. Long: a corpus rarely changes character, and the stale profile is
+    # still served while the new one is built, so this is not a latency dial.
+    profile_ttl_hours: int = 24
+    # Concurrent probes across the whole process. Small on purpose — each one
+    # opens a connection into somebody else's database, and a burst of
+    # reconnects must not become a burst of guests in other people's Postgres.
+    profile_workers: int = 2
+    # The card goes into a system prompt, so its cost is paid on every turn.
+    # ~700 characters is three or four lines: what the store is, what it is
+    # good for, what may be filtered.
+    profile_card_chars: int = 700
+    # The realtime read is from memory. Short enough that a re-profile is
+    # picked up within a conversation, long enough that a voice turn never
+    # waits on Postgres for it.
+    profile_cache_ttl_s: float = 60.0
+    profile_cache_size: int = 256
+
+    # ---- Capability discovery (docs/23-capabilities.md) ------------------
+    # The cards above are no longer read out into every prompt. The agent gets
+    # one tool, `find_capability`, and searches them the way retrieval searches
+    # passages — so a turn pays for the description of a store only when the
+    # question might actually be about it.
+    capabilities_enabled: bool = True
+    # How far the best card must sit above the mean of *this person's own*
+    # cards. Lift rather than an absolute cosine, because e5 over short cards
+    # sits in a narrow band that moves with the cards: measured on one real
+    # account, "summary of the book The Laws of Human Nature" scored 0.797 and
+    # "how are you feeling today" scored 0.794, while their lifts were 0.027
+    # and 0.010. Across a dozen queries the relevant ones lift 0.027-0.120 and
+    # the irrelevant ones 0.010-0.019, so this sits in that gap. Below it
+    # nothing is returned and the agent says it cannot reach anything that
+    # covers the question, which is the honest answer.
+    capability_min_lift: float = 0.023
+    # The fallback's floor, on the fallback's scale: the share of the
+    # question's own words that appear in the card, used when the embedder is
+    # unavailable. A separate number because it is a separate measurement;
+    # one threshold across both would make this path either mute or
+    # indiscriminate.
+    capability_min_overlap: float = 0.34
+    # How many capabilities one search may hand back. Three is enough for
+    # "the dataset *and* the store both look relevant" without turning the
+    # answer into the prompt block this replaced.
+    capability_max_matches: int = 3
+
+    # ---- Datasets (docs/18-datasets.md) ---------------------------------
+    # A user pastes a dataset URL; this app pulls a bounded prefix of it onto
+    # local disk, measures it, and answers questions about it in SQL. The two
+    # halves have opposite constraints — building is slow and off every request
+    # path, querying is sealed and runs inside a turn — so most of what is here
+    # is a ceiling on one of them.
+    datasets_enabled: bool = True
+    # Where materialised DuckDB files live. Alongside the embedding cache, and
+    # for the same reason: it is derived data this app can always rebuild.
+    dataset_dir: str = "data/datasets"
+    # Per user. Each dataset is a file on disk and an entry in a system prompt,
+    # so both disk and prompt budget grow with this.
+    dataset_max_per_user: int = 10
+    # Files pulled from one source. A repo of 28 splits becomes 12 tables and
+    # says so — `Source.truncated` is rendered into the card rather than
+    # dropped, because a dataset that quietly describes half of itself routes
+    # on the half it mentioned and nothing reads as wrong.
+    dataset_max_tables: int = 12
+    # Rows per table. A prefix, not a sample: `LIMIT` on a parquet read stops
+    # at a row-group boundary, and a uniform sample would mean downloading the
+    # whole file for every dataset anybody adds. Stated wherever it is served.
+    dataset_sample_rows: int = 25_000
+    # A column whose projected download exceeds this is not materialised, and
+    # is named in the profile as unavailable. This is the single largest dial
+    # in the feature: on MSMARCO-XI one column is 453 MB of a 470 MB file, and
+    # skipping it turned a 257 s pull into 30 s for four times the rows. Raise
+    # it when a wide column is the point of the dataset.
+    dataset_column_budget_mb: int = 32
+    # Concurrent builds across the whole process. Small: each one holds a
+    # network read and writes a file, and a burst of adds must not become a
+    # burst of multi-hundred-megabyte downloads.
+    dataset_build_workers: int = 2
+    dataset_table_timeout_s: float = 180.0
+    dataset_http_timeout_s: float = 60.0
+    # Whether a few sample rows may be sent to the model that names the
+    # dataset. Off keeps the profile to measurements, which still drives every
+    # line of the schema card and only costs the routing hints.
+    dataset_narrate: bool = True
+    # How long a build is trusted before a rebuild is scheduled behind it.
+    # A week: the source is a pinned revision of somebody's published dataset,
+    # and the stale profile is still served while the new one is built.
+    dataset_ttl_hours: int = 168
+    dataset_cache_ttl_s: float = 60.0
+    # The routing card, paid on every turn. Wider than a connector's 700
+    # because a dataset card carries caveats a store card has no equivalent of
+    # — which rows are loaded, which files were not, which columns are absent —
+    # and those are ordered ahead of the routing hints so a trim loses the hint
+    # rather than the caveat.
+    dataset_card_chars: int = 1000
+    # The schema block, paid only on turns that actually query.
+    dataset_schema_chars: int = 6000
+
+    # ---- Dataset queries ------------------------------------------------
+    # Rows a single query may return. The consumer is a model that will read
+    # them into a sentence, so this is a prompt budget more than a memory one.
+    dataset_query_rows: int = 200
+    # A query past this is interrupted inside DuckDB. Local and sealed, so a
+    # well-formed query finishes in milliseconds and this only ever catches an
+    # accidental cross join.
+    dataset_query_timeout_s: float = 10.0
+    dataset_sandbox_open: int = 8
+    dataset_sandbox_memory: str = "512MB"
+    dataset_sandbox_threads: int = 2
+    # What one query's rows may cost the prompt they go back into.
+    dataset_result_chars: int = 4000
+    # How many times a failed query is handed back to the model with the error.
+    # One: a repair fixes a wrong column name, and a second attempt after that
+    # is the model trying a different wrong answer at the listener's expense.
+    dataset_sql_repairs: int = 1
 
     # ---- Retrieval ------------------------------------------------------
     search_limit: int = 10
@@ -230,7 +356,10 @@ class Settings(BaseSettings):
     #   3 corrective  + relevance grading, query rewrite, one re-retrieval
     #   4 adaptive    + routing before retrieval, capped repair loop
     effort_max: int = 4
-    effort_default: int = 1
+    # Deep: the first rung that writes rather than quotes. Rungs 0-1 exist for
+    # the 200 ms claim, which is a claim about retrieval, not about a spoken
+    # turn that is already waiting on a model.
+    effort_default: int = 2
 
     # Each rung gets its own budget. Requirement 3's 200 ms is a claim about
     # rungs 0–1, which are the ones with no network call after the transcript;
@@ -275,7 +404,7 @@ class Settings(BaseSettings):
     # against the sentences of the context it was given. Below this, the answer
     # is not supported by what was retrieved and the pipeline abstains.
     # Local — the embedder is already loaded — so the gate costs milliseconds,
-    # not a round trip. Sweep it with scripts/evaluate.py after any re-ingest.
+    # not a round trip.
     generation_support_floor: float = 0.62
     # How many of the answer's sentences may fall below that floor and still
     # pass. One unsupported clause in a four-sentence answer is a hedge; half
@@ -396,8 +525,10 @@ class Settings(BaseSettings):
     agent_memory_max_chars: int = 2_000
 
     # ---- Guardrails (docs/06-guardrails.md) -----------------------------
-    # Gate 2, swept against the labelled abstention set by `scripts/evaluate.py`
-    # over N=300 and set to the balanced operating point (docs/09-v1.md):
+    # Gate 2, swept against a labelled abstention set over N=300 and set to the
+    # balanced operating point (docs/09-v1.md). The sweep ran against the one
+    # corpus this app used to hold; a connected store is somebody else's and
+    # these are the floor to re-check first if its recall looks wrong:
     #
     #   margin  abstention recall  answer coverage
     #   0.010   0.34                0.75      permissive
@@ -406,15 +537,15 @@ class Settings(BaseSettings):
     #
     # The floor is nearly inert over 0.78–0.86 — e5 cosine scores are compressed
     # high, so almost nothing falls below it and the margin does the work. Both
-    # are index-size dependent: re-sweep after any re-ingest.
+    # are index-size dependent: re-sweep against a store of a different size.
     retrieval_floor: float = 0.845
     # The same floor, for a question asked in a language the index does not
     # hold. Cross-lingual cosines sit lower — the query and the passage are in
     # different languages, and e5 places a translation pair close but not as
     # close as a paraphrase — so the swept thresholds above abstain on
     # retrieval that was right. Measured rather than guessed, by
-    # `scripts/crosslingual.py` over 200 questions asked twice, once in each
-    # language (docs/13-cross-lingual.md):
+    # `reports/crosslingual.json` over 200 questions asked twice, once in each
+    # language (docs/13a-cross-lingual.md):
     #
     #                top score  margin  recall@5
     #   hindi           0.8942  0.0239    0.6967
@@ -422,7 +553,7 @@ class Settings(BaseSettings):
     #
     # 0.78 is the highest floor that costs nothing: coverage is flat from 0.70
     # to 0.78 and falls from 0.80 up, so under it the margin decides — the same
-    # regime the Hindi floor was picked in. Re-measure after any re-ingest.
+    # regime the Hindi floor was picked in. Re-measure against another store.
     retrieval_floor_cross_lingual: float = 0.78
     retrieval_margin: float = 0.02
     # The margin matters far more than the floor here, because the gaps

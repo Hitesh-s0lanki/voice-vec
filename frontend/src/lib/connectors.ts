@@ -21,8 +21,15 @@ export type ConnectorField = {
   help: string;
 };
 
-/** "tools" is Composio; "vector" is where a user's embeddings live. */
-export type ConnectorKind = "tools" | "vector";
+/**
+ * "tools" is Composio; "vector" is where a user's embeddings live; "dataset"
+ * is a URL to parquet or CSV that gets pulled local and answered in SQL.
+ *
+ * This union is load-bearing rather than descriptive: the panel renders one
+ * section per kind and filters rows into them, so a kind missing from here is
+ * a connector the server offers and the panel silently drops.
+ */
+export type ConnectorKind = "tools" | "vector" | "dataset";
 
 export type Connector = {
   slug: string;
@@ -44,7 +51,7 @@ export type ConnectorList = {
   connectors: Connector[];
   /** False when the server cannot hold a credential at all. */
   configured: boolean;
-  /** Which store answers this user's retrieval; null = the deployment's own. */
+  /** Which store answers this user's retrieval; null = nothing does yet. */
   vectorBackend: string | null;
 };
 
