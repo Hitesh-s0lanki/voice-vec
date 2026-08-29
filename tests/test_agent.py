@@ -9,7 +9,8 @@ which is what makes them worth pinning:
     buffered round trip in front of the first spoken word for no reason;
   - a failed tool swallowed instead of reported, so the model invents an answer
     from a silence;
-  - arguments stored unbounded, or a result stored at all.
+  - arguments stored unbounded, or a result stored whole rather than as the
+    bounded preview the thread reads back.
 """
 
 from __future__ import annotations
@@ -21,8 +22,14 @@ import pytest
 
 import src.voice.llm as llm
 from src.chat.store import Owner
-from src.chat.tools import MAX_ARGUMENT_CHARS, toolkit_of, trim
-from src.integrations.agent import MAX_RESULT_CHARS, ToolResult
+from src.chat.tool_calls import (
+    MAX_ARGUMENT_CHARS,
+    MAX_RESULT_CHARS as STORED_RESULT_CHARS,
+    toolkit_of,
+    trim,
+    trim_result,
+)
+from src.tools.result import MAX_RESULT_CHARS, ToolResult
 from src.services.voice_service import VoiceSession
 
 TOOLS = [{"type": "function", "function": {"name": "GMAIL_FETCH", "parameters": {}}}]
@@ -166,7 +173,7 @@ class TestFailuresAreReported:
 
     def test_a_tool_that_raises_becomes_a_result_not_an_exception(self):
         """The turn is mid-sentence; it has to continue either way."""
-        from src.integrations.agent import ToolAgent
+        from src.agents.tool_agent import ToolAgent
 
         agent = ToolAgent(
             SimpleNamespace(
@@ -186,7 +193,7 @@ class TestFailuresAreReported:
 
     def test_composio_reporting_failure_in_the_body_is_not_success(self):
         """A 200 with successful=False is a failed tool, not a working one."""
-        from src.integrations.agent import ToolAgent
+        from src.agents.tool_agent import ToolAgent
 
         agent = ToolAgent(
             SimpleNamespace(
@@ -237,13 +244,25 @@ class TestWhatIsWrittenDown:
     def test_unserialisable_arguments_do_not_break_the_write(self):
         assert trim({"f": object()}) != {}
 
-    def test_the_wire_shape_cannot_carry_a_tool_result(self):
-        """The audit table keeps a result's size, never its content.
+    def test_a_small_result_is_stored_as_it_came_back(self):
+        assert trim_result('{"unread": 3}') == '{"unread": 3}'
 
-        A field here would make this an uncontrolled copy of everything the
-        agent has ever read — worse to hold than the credential that reached it.
-        """
+    def test_an_oversized_result_is_cut_and_marked(self):
+        """The ceiling is the containment — a preview, not the inbox page."""
+        stored = trim_result("x" * (STORED_RESULT_CHARS * 3))
+
+        assert stored is not None
+        assert len(stored) <= STORED_RESULT_CHARS + 32
+        assert stored.endswith("(truncated)")
+
+    @pytest.mark.parametrize("value", [None, "", "   \n "])
+    def test_nothing_coming_back_stores_nothing(self, value):
+        """An empty box in the thread says less than the status already does."""
+        assert trim_result(value) is None
+
+    def test_the_wire_carries_the_preview_and_the_whole_size(self):
+        """Both, or a truncated result reads as the entire result."""
         from src.schemas.chat import ToolCall
 
-        assert "result" not in ToolCall.model_fields
+        assert "result" in ToolCall.model_fields
         assert "result_bytes" in ToolCall.model_fields

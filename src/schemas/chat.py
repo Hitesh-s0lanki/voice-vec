@@ -40,11 +40,12 @@ class ChatMessage(Wire):
 
 
 class ToolCall(Wire):
-    """One tool the agent ran, as the panel shows it.
+    """One tool the agent ran, as the card shows it: what went in, what came out.
 
-    No result. The store keeps its *size* and not its content — an audit table
-    should not become a copy of everything the agent has ever read — so there
-    is nothing here that could carry somebody's inbox onto the wire.
+    The result travels as a bounded preview, never the whole payload — see
+    `src/chat/tool_calls.py` for why the ceiling is the containment. `result_bytes`
+    is the size of the *whole* result, so the two together say how much of it
+    is on screen.
     """
 
     id: str
@@ -55,7 +56,12 @@ class ToolCall(Wire):
     status: str = Field(description="ok · failed")
     ok: bool = False
     error: str | None = None
-    result_bytes: int | None = None
+    result: str | None = Field(
+        default=None, description="The head of what came back, bounded and marked"
+    )
+    result_bytes: int | None = Field(
+        default=None, description="The size of all of it, preview or not"
+    )
     latency_ms: float | None = None
     created_at: datetime
 

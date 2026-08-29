@@ -1,8 +1,9 @@
 "use client";
 
 import { useAuth } from "@clerk/nextjs";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import type { ToolCall as StoredToolCall } from "@/lib/conversations";
 import { useEffort } from "@/lib/effort";
 import { browserSessionId } from "@/lib/identity";
 import { PcmPlayer } from "@/lib/pcm-player";
@@ -69,6 +70,48 @@ export type ActivityLine = {
 /** Rows kept in memory. The card shows a handful; this is the scrollback. */
 const MAX_ACTIVITY = 24;
 
+/** How a tool the agent reached for ended up. */
+export type ToolCallState = "running" | "ok" | "error" | "skipped";
+
+/**
+ * One tool the agent ran, as its own row.
+ *
+ * The activity log folds every `tool` frame of a turn into a single line —
+ * right for a pipeline step, wrong for the tools themselves, where "three ran,
+ * the second one failed" is the whole story and one row can only tell a third
+ * of it. So the same frames are folded a second time here, keyed per call
+ * instead of per step.
+ *
+ * The socket does not carry a call id, so the pairing is by name: a round
+ * opens with `state: "start"` listing the names the model chose, and each call
+ * then reports `done` or `error` under its own name, in the order the server
+ * ran them. Matching the *first still-running* row with that name is what
+ * keeps the same tool called twice in one round as two rows.
+ */
+export type ToolCall = {
+  key: string;
+  turnId: string | null;
+  /** The raw slug — `GMAIL_FETCH_EMAILS`, `query_dataset`. */
+  name: string;
+  state: ToolCallState;
+  /** Why it failed, when it did. */
+  detail: string | null;
+  /**
+   * How long this call took, not how far into the turn it finished.
+   *
+   * Every `ms` on the wire is elapsed-since-the-turn-started, so the duration
+   * is the gap between two of them. Tools in a round run one after another,
+   * which makes the previous call's finish the next one's start.
+   */
+  ms: number | null;
+  /** Elapsed at the moment this call began. Bookkeeping for the line above. */
+  startedMs: number | null;
+  at: number;
+};
+
+/** Tool rows kept in memory. A turn that runs more than this is pathological. */
+const MAX_TOOL_CALLS = 32;
+
 export type Exchange = {
   id: string;
   at: number;
@@ -83,8 +126,6 @@ export type Exchange = {
 };
 
 type Options = {
-  /** Keep the microphone going after the assistant finishes speaking. */
-  handsFree?: boolean;
   /** Called once per completed take, so a caller can log the turn. */
   onExchange?: (exchange: Exchange) => void;
   /**
@@ -100,6 +141,18 @@ type Options = {
    * the first take of a new one — the moment the address bar should change.
    */
   onConversation?: (id: string, created: boolean) => void;
+  /**
+   * A tool finished, with both halves of it — what the agent sent and what
+   * came back. Fired once per call, as it lands rather than at the end of the
+   * turn, and it carries the id the backend is writing the row under, so the
+   * same call arriving again in a stored thread is recognisable.
+   *
+   * Separate from the `ToolCall` rows this hook keeps for the stage card:
+   * those are folded from `activity` and exist from the moment a call starts,
+   * which is what lets the card say "running". This one only exists once
+   * there is a result to report.
+   */
+  onTool?: (call: StoredToolCall) => void;
 };
 
 function pickMimeType(): string | undefined {
@@ -123,10 +176,10 @@ function pickMimeType(): string | undefined {
  * pressing the orb mid-answer stops the speech instead of queueing behind it.
  */
 export function useVoiceSession({
-  handsFree = false,
   onExchange,
   conversationId,
   onConversation,
+  onTool,
 }: Options = {}) {
   // The socket is opened against FastAPI directly, so signing in has to be
   // proved to it rather than assumed: `getToken` mints a short-lived Clerk
@@ -142,6 +195,7 @@ export function useVoiceSession({
   const [providers, setProviders] = useState<Providers | null>(null);
   const [exchanges, setExchanges] = useState<Exchange[]>([]);
   const [activity, setActivity] = useState<ActivityLine[]>([]);
+  const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
   const [connected, setConnected] = useState(false);
 
   // React runs a state updater during render, so anything with a side effect
@@ -167,6 +221,8 @@ export function useVoiceSession({
   const tickTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const armingRef = useRef(false);
+  /** Monotonic, so a row's key survives the list being trimmed under it. */
+  const toolSeqRef = useRef(0);
   /** A connection whose token is still being fetched — see `connect`. */
   const openingRef = useRef(false);
   const abandonedRef = useRef(false);
@@ -180,28 +236,27 @@ export function useVoiceSession({
   }, [getToken]);
 
   // The rung to ask for, read at the moment a take starts. Through a ref for
-  // the same reason as everything else here: moving the slider must not rebuild
-  // `start`, which the hands-free effect below holds in its dependencies and
-  // would re-arm the microphone on.
+  // the same reason as everything else here: moving the slider mid-take must
+  // not rebuild `start` and tear the recorder down under it.
   const [effort] = useEffort();
   const effortRef = useRef(effort);
   useEffect(() => {
     effortRef.current = effort;
   }, [effort]);
 
-  const handsFreeRef = useRef(handsFree);
   const exchangeRef = useRef(onExchange);
   const conversationRef = useRef(onConversation);
+  const toolRef = useRef(onTool);
   const statusRef = useRef<VoiceStatus>("idle");
-  useEffect(() => {
-    handsFreeRef.current = handsFree;
-  }, [handsFree]);
   useEffect(() => {
     exchangeRef.current = onExchange;
   }, [onExchange]);
   useEffect(() => {
     conversationRef.current = onConversation;
   }, [onConversation]);
+  useEffect(() => {
+    toolRef.current = onTool;
+  }, [onTool]);
   useEffect(() => {
     statusRef.current = status;
   }, [status]);
@@ -236,6 +291,92 @@ export function useVoiceSession({
   }, []);
 
   /**
+   * Fold one `tool` frame into the per-call list.
+   *
+   * `start` opens a round: one row per name the model chose, all pending.
+   * Everything else closes one of them. A close with no matching pending row
+   * still lands — a client that missed the round's opening frame should show
+   * the tool that ran, not nothing.
+   */
+  const noteTool = useCallback(
+    (event: Extract<ServerEvent, { type: "activity" }>) => {
+      setToolCalls((previous) => {
+        if (event.state === "start") {
+          const names = (event.detail ?? "")
+            .split(",")
+            .map((name) => name.trim())
+            .filter(Boolean);
+          if (!names.length) return previous;
+
+          const opened = names.map<ToolCall>((name) => ({
+            key: `${event.turnId ?? "-"}|${toolSeqRef.current++}`,
+            turnId: event.turnId,
+            name,
+            state: "running",
+            detail: null,
+            ms: null,
+            startedMs: event.ms,
+            at: Date.now(),
+          }));
+          return [...previous, ...opened].slice(-MAX_TOOL_CALLS);
+        }
+
+        const state: ToolCallState =
+          event.state === "error"
+            ? "error"
+            : event.state === "done"
+              ? "ok"
+              : "skipped";
+
+        const next = [...previous];
+        const at = next.findIndex(
+          (call) =>
+            call.turnId === event.turnId &&
+            call.name === event.label &&
+            call.state === "running",
+        );
+
+        if (at === -1) {
+          next.push({
+            key: `${event.turnId ?? "-"}|${toolSeqRef.current++}`,
+            turnId: event.turnId,
+            name: event.label,
+            state,
+            detail: event.detail,
+            ms: null,
+            startedMs: null,
+            at: Date.now(),
+          });
+          return next.slice(-MAX_TOOL_CALLS);
+        }
+
+        const opened = next[at];
+        next[at] = {
+          ...opened,
+          state,
+          detail: event.detail,
+          ms:
+            event.ms !== null && opened.startedMs !== null
+              ? Math.max(0, event.ms - opened.startedMs)
+              : null,
+        };
+
+        // Tools in a round are awaited one at a time, so this call finishing
+        // is the next one starting — and the only clock the next row will get.
+        const after = next.findIndex(
+          (call, index) =>
+            index > at && call.turnId === event.turnId && call.state === "running",
+        );
+        if (after !== -1 && event.ms !== null)
+          next[after] = { ...next[after], startedMs: event.ms };
+
+        return next;
+      });
+    },
+    [],
+  );
+
+  /**
    * Stop the pulse on anything still running for a turn.
    *
    * A step only reports "done" when it finishes, and an interrupted one never
@@ -253,6 +394,17 @@ export function useVoiceSession({
         (row.state === "running" || row.state === "start")
           ? { ...row, state: "skipped" as const }
           : row,
+      ),
+    );
+
+    // Same reasoning for the tool rows: a call that was still running when the
+    // turn ended never reports, and a row left pulsing over a finished turn
+    // claims work is happening that stopped a question ago.
+    setToolCalls((previous) =>
+      previous.map((call) =>
+        call.turnId === turnId && call.state === "running"
+          ? { ...call, state: "skipped" as const }
+          : call,
       ),
     );
   }, []);
@@ -375,6 +527,9 @@ export function useVoiceSession({
             break;
 
           case "activity":
+            // Two folds of the same frame: one row per pipeline step for the
+            // log, one row per call for the tool card.
+            if (event.step === "tool") noteTool(event);
             note({
               key: `${event.turnId ?? "-"}|${event.step}`,
               turnId: event.turnId,
@@ -385,6 +540,14 @@ export function useVoiceSession({
               ms: event.ms,
               at: Date.now(),
             });
+            break;
+
+          case "tool":
+            // The whole call, for the thread. The row the stage card draws was
+            // already opened by the `activity` frame above and settled by the
+            // one that follows it — this is the same call said in full, and
+            // the panel is the only thing with room to show it.
+            toolRef.current?.(event);
             break;
 
           case "transcript":
@@ -498,7 +661,7 @@ export function useVoiceSession({
     // handed at the last handshake, and the next conversation someone started
     // after signing in would still be filed under the browser.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [conversationId, note, player, settle, update, userId]);
+  }, [conversationId, note, noteTool, player, settle, update, userId]);
 
   useEffect(() => {
     reconnectRef.current = connect;
@@ -740,28 +903,28 @@ export function useVoiceSession({
     send({ type: "reset" });
     update(() => []);
     setActivity([]);
+    setToolCalls([]);
     setError(null);
     setStatus("idle");
   }, [send, update]);
-
-  // Hands-free: the moment the reply finishes playing, open the microphone
-  // again. Without it every turn costs a tap, which is not a conversation.
-  useEffect(() => {
-    if (!handsFree || status !== "idle") return;
-    if (exchanges.length === 0) return;
-
-    const last = exchanges[exchanges.length - 1];
-    if (!last.done) return;
-
-    const timer = setTimeout(() => void start(), 350);
-    return () => clearTimeout(timer);
-  }, [exchanges, handsFree, start, status]);
 
   useEffect(() => teardown, [teardown]);
 
   const listening = status === "listening";
   const speaking = status === "speaking";
   const working = status === "transcribing" || status === "thinking";
+
+  const current = exchanges[exchanges.length - 1] ?? null;
+
+  /**
+   * The tools this turn ran. The list behind it is scrollback for a session;
+   * what a card in the corner can usefully hold is one turn's worth, and the
+   * turn on screen is the one the transcript beside it is showing.
+   */
+  const currentTools = useMemo(
+    () => toolCalls.filter((call) => call.turnId === current?.id),
+    [toolCalls, current?.id],
+  );
 
   return {
     status,
@@ -776,7 +939,9 @@ export function useVoiceSession({
     connected,
     exchanges,
     activity,
-    current: exchanges[exchanges.length - 1] ?? null,
+    toolCalls,
+    currentTools,
+    current,
     start,
     stop,
     cancel,

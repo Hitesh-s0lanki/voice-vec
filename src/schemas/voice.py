@@ -11,6 +11,8 @@ arrived — which is why that event carries the format instead of each chunk.
     → <binary …>             ← activity {step: stt, state: start}
     → audio.end              ← transcript {text, languageCode}
                              ← status  {stage: thinking}
+                             ← activity {step: tool, state: done}   … many
+                             ← tool     {slug, arguments, result}   … many
                              ← activity {step: llm, state: start}  … many
                              ← delta   {text}          … many
                              ← speech.start {segment, sampleRate, …}
@@ -24,6 +26,7 @@ orb and the activity line drives a log — one has to stay a closed set of four,
 the other has to stay open enough to add a step to.
 """
 
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import Field
@@ -56,7 +59,6 @@ class Providers(Wire):
     llm: str | None
     llm_model: str | None
     tts: str | None
-    rag_enabled: bool
     #: The highest rung of the effort ladder this deployment will run. The
     #: panel renders positions it can actually reach rather than a slider whose
     #: top half quietly behaves like its middle (docs/15-effort.md).
@@ -131,6 +133,41 @@ class Activity(Wire):
     label: str = Field(description="Short, human, present tense: 'Searching the corpus'")
     detail: str | None = Field(default=None, description="Who or what — provider, model, count")
     ms: float | None = Field(default=None, description="Elapsed at this point in the turn")
+
+
+class ToolEvent(Wire):
+    """One finished tool call, whole, the moment it finishes.
+
+    `activity` already says *that* a tool ran, which is all a step-shaped event
+    can carry and enough for the log beside the orb. The thread wants the call
+    itself: what the agent decided, what came back, and how much of it there
+    was. None of that fits in a `label` and a `detail`, so it travels here
+    instead — in exactly the shape `/conversations/{id}` returns it in
+    (`src/schemas/chat.py`), so the panel renders a turn being spoken and a
+    turn read back out of Postgres with the same component.
+
+    Sent whether or not there is a database. A deployment with no
+    `DATABASE_URL` still shows what ran in the session it is in; what it loses
+    is reading it back tomorrow.
+    """
+
+    type: Literal["tool"] = "tool"
+    id: str = Field(description="The id the row is written under, so the two agree")
+    turn_id: str | None = None
+    toolkit: str | None = Field(default=None, description="gmail, slack, …")
+    slug: str = Field(description="Composio's own, e.g. GMAIL_SEND_EMAIL")
+    arguments: dict = Field(default_factory=dict, description="What the agent decided")
+    status: str = Field(description="ok · failed")
+    ok: bool = False
+    error: str | None = None
+    result: str | None = Field(
+        default=None, description="The head of what came back, bounded and marked"
+    )
+    result_bytes: int | None = Field(
+        default=None, description="The size of all of it, preview or not"
+    )
+    latency_ms: float | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class TranscriptEvent(Wire):

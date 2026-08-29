@@ -6,6 +6,8 @@
  * which is why the format lives on that event and not on the audio.
  */
 
+import type { ToolCall } from "@/lib/conversations";
+
 export type VoiceStage = "idle" | "transcribing" | "thinking" | "speaking";
 
 export type Providers = {
@@ -13,7 +15,6 @@ export type Providers = {
   llm: string | null;
   llmModel: string | null;
   tts: string | null;
-  ragEnabled: boolean;
   /** Highest rung of the effort ladder this deployment will run. */
   effortMax: number;
   /**
@@ -94,6 +95,22 @@ export type ServerEvent =
       /** Elapsed at this point in the turn. */
       ms: number | null;
     }
+  | ({
+      /**
+       * One finished tool call, whole — arguments in, result out.
+       *
+       * `activity` says *that* a tool ran, which is all a step-shaped frame
+       * can carry. This is the call itself, and it is deliberately the same
+       * `ToolCall` the stored thread returns rather than a shape of its own:
+       * the panel draws a turn being spoken and a turn read back out of
+       * Postgres with one component, and two near-identical types would let
+       * those two drift apart a field at a time.
+       *
+       * `id` is the id the row will be written under, so a call announced now
+       * and the same call fetched after a reload are recognisably one call.
+       */
+      type: "tool";
+    } & ToolCall)
   | {
       type: "transcript";
       turnId: string;
