@@ -66,9 +66,22 @@ jobs:
           # No --frozen: UV_LOCKED above is the env form of --locked, and uv
           # refuses the two together.
           uv export --no-dev --no-emit-project --no-hashes --no-header \
-            --format requirements-txt > /tmp/requirements.check
-          if ! diff -u <(grep -vE '^\s*(#|$)' requirements.txt) \
-                      <(grep -vE '^\s*(#|$)' /tmp/requirements.check); then
+            --format requirements-txt > "$RUNNER_TEMP/generated.txt"
+
+          # Compare the pins only. Both files carry `# via` annotation lines,
+          # which are indented, and the `^[A-Za-z0-9]` filter drops them the
+          # same way on every grep — an earlier `^\s*(#|$)` filter stripped them
+          # from one side and not the other on the runner, which reported a
+          # lockfile that matched as one that did not.
+          #
+          # Two plain files rather than process substitution, so a failure shows
+          # what was actually compared.
+          grep -E '^[A-Za-z0-9]' requirements.txt > "$RUNNER_TEMP/committed.pins"
+          grep -E '^[A-Za-z0-9]' "$RUNNER_TEMP/generated.txt" > "$RUNNER_TEMP/generated.pins"
+          echo "committed: $(wc -l < "$RUNNER_TEMP/committed.pins") pins"
+          echo "generated: $(wc -l < "$RUNNER_TEMP/generated.pins") pins"
+
+          if ! diff -u "$RUNNER_TEMP/committed.pins" "$RUNNER_TEMP/generated.pins"; then
             echo '::error::requirements.txt is out of date — regenerate it from uv.lock'
             exit 1
           fi
