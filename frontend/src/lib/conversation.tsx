@@ -71,6 +71,20 @@ export type Turn = {
 /** Stable empty reference, so an unloaded conversation re-renders nothing. */
 const NO_TURNS: Turn[] = [];
 
+/** The same, for a turn that ran nothing — which is most of them. */
+const NO_TOOLS: ToolCall[] = [];
+
+/**
+ * Add a call to a list, ignoring one that is already there.
+ *
+ * Idempotent by id, and that is what the backend minting the id before it
+ * writes the row buys: the call the socket announced mid-turn and the call a
+ * later fetch returns are the same entry rather than the same tool twice.
+ */
+function including(calls: ToolCall[], call: ToolCall): ToolCall[] {
+  return calls.some((existing) => existing.id === call.id) ? calls : [...calls, call];
+}
+
 /**
  * Fold a stored thread back into turns.
  *
@@ -163,6 +177,14 @@ type ConversationValue = {
   /** Fill in the reply slot on an already-recorded turn. */
   answer: (id: string, reply: Reply) => void;
   /**
+   * File one finished tool call under the turn that ran it.
+   *
+   * Held aside when that turn is not on screen yet, which is the normal case
+   * rather than the edge: tools run in the middle of a turn and the turn is
+   * recorded at the end of it, so a call almost always arrives first.
+   */
+  attach: (call: ToolCall) => void;
+  /**
    * The socket just opened a conversation for what is being said. Puts
    * `/c/{id}` in the address bar without a navigation — a route change here
    * would tear down the socket mid-sentence.
@@ -195,9 +217,23 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
    * `id: null` is the real conversation on `/` — the one being spoken now,
    * which has no address until the server gives it one.
    */
-  const [state, setState] = useState<{ id: string | null; turns: Turn[] }>({
+  const [state, setState] = useState<{
+    id: string | null;
+    turns: Turn[];
+    /**
+     * Tool calls waiting for the turn that ran them, keyed by turn id.
+     *
+     * The socket announces a call the moment it finishes, and the turn itself
+     * is recorded when the reply lands — so for a turn that ran anything, the
+     * calls are here first and `record` collects them on the way past. They
+     * live in state rather than a ref because dropping one is the bug being
+     * fixed and a ref would let a render pass go by without noticing it.
+     */
+    pending: Record<string, ToolCall[]>;
+  }>({
     id: null,
     turns: NO_TURNS,
+    pending: {},
   });
 
   /**
@@ -225,7 +261,15 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       // A conversation that is gone, or was never this browser's, comes back
       // null. Showing it empty is the honest answer — and the next thing said
       // opens a new one, so the page is never stuck.
-      setState({ id: conversationId, turns: detail ? thread(detail.messages, detail.toolCalls) : NO_TURNS });
+      //
+      // `pending` starts over with it: this only runs for a conversation the
+      // provider was not already holding, so anything buffered belongs to the
+      // one being left, and the stored rows are the authority for this one.
+      setState({
+        id: conversationId,
+        turns: detail ? thread(detail.messages, detail.toolCalls) : NO_TURNS,
+        pending: {},
+      });
     });
 
     return () => abort.abort();
@@ -237,26 +281,33 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       if (!text) return null;
 
       const turnId = id ?? crypto.randomUUID();
-      const fresh: Turn = {
-        id: turnId,
-        at: Date.now(),
-        text,
-        languageCode: transcript.languageCode,
-        reply: null,
-        replyStatus: null,
-        replyReason: null,
-        replyMs: null,
-        // A turn being spoken right now has none yet. The socket reports what
-        // the agent ran as `activity`, and the stored list arrives on the next
-        // load of /c/{id} — this optimistic copy does not try to guess it.
-        tools: [],
-      };
+      const at = Date.now();
 
       setState((previous) => {
+        // Whatever the socket already said this turn ran. Taken out of the
+        // buffer as the turn is filed, so the calls stop being held for a turn
+        // that now exists — the two halves of what the panel shows under one
+        // exchange arrive from opposite ends of it and meet here.
+        const { [turnId]: ran = NO_TOOLS, ...waiting } = previous.pending;
+
+        const fresh: Turn = {
+          id: turnId,
+          at,
+          text,
+          languageCode: transcript.languageCode,
+          reply: null,
+          replyStatus: null,
+          replyReason: null,
+          replyMs: null,
+          tools: ran,
+        };
+
         // Recording into a different conversation than the list holds starts
-        // the list over — that is what leaving one for another means.
+        // the list over — that is what leaving one for another means. The
+        // buffer goes with it: what is left in it belongs to turns of the
+        // conversation being left, which are no longer on screen to hang it on.
         if (previous.id !== conversationId) {
-          return { id: conversationId, turns: [fresh] };
+          return { id: conversationId, turns: [fresh], pending: {} };
         }
 
         // Idempotent by id. A turn reported twice — a barge-in that the server
@@ -264,15 +315,23 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
         if (previous.turns.some((turn) => turn.id === turnId)) {
           return {
             id: previous.id,
+            pending: waiting,
             turns: previous.turns.map((turn) =>
               turn.id === turnId
-                ? { ...turn, text, languageCode: transcript.languageCode }
+                ? {
+                    ...turn,
+                    text,
+                    languageCode: transcript.languageCode,
+                    // Merged rather than replaced: the first report may already
+                    // have collected calls this one would drop on the floor.
+                    tools: ran.reduce(including, turn.tools),
+                  }
                 : turn,
             ),
           };
         }
 
-        return { id: previous.id, turns: [...previous.turns, fresh] };
+        return { id: previous.id, turns: [...previous.turns, fresh], pending: waiting };
       });
 
       return turnId;
@@ -282,11 +341,43 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
 
   const answer = useCallback((id: string, reply: Reply) => {
     setState((previous) => ({
-      id: previous.id,
+      ...previous,
       turns: previous.turns.map((turn) =>
         turn.id === id ? { ...turn, ...reply } : turn,
       ),
     }));
+  }, []);
+
+  /**
+   * One tool call, filed under its turn.
+   *
+   * The turn is usually not here yet — a call finishes in the middle of an
+   * exchange and the exchange is recorded at the end of it — so the miss is
+   * the normal path and buffering it is the point. A call with no turn id is
+   * dropped: on its own it says nothing the thread can place.
+   */
+  const attach = useCallback((call: ToolCall) => {
+    const turnId = call.turnId;
+    if (!turnId) return;
+
+    setState((previous) => {
+      if (!previous.turns.some((turn) => turn.id === turnId)) {
+        return {
+          ...previous,
+          pending: {
+            ...previous.pending,
+            [turnId]: including(previous.pending[turnId] ?? NO_TOOLS, call),
+          },
+        };
+      }
+
+      return {
+        ...previous,
+        turns: previous.turns.map((turn) =>
+          turn.id === turnId ? { ...turn, tools: including(turn.tools, call) } : turn,
+        ),
+      };
+    });
   }, []);
 
   const adopt = useCallback((id: string) => {
@@ -308,7 +399,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
 
   const reset = useCallback(() => {
     held.current = null;
-    setState({ id: null, turns: NO_TURNS });
+    setState({ id: null, turns: NO_TURNS, pending: {} });
     router.push("/");
   }, [router]);
 
@@ -321,10 +412,11 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       loading: conversationId !== null && !mine,
       record,
       answer,
+      attach,
       adopt,
       reset,
     }),
-    [conversationId, turns, mine, record, answer, adopt, reset],
+    [conversationId, turns, mine, record, answer, attach, adopt, reset],
   );
 
   return (

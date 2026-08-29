@@ -71,7 +71,14 @@ export const OFFLINE_MAX_LEVEL = 1;
 
 export const EFFORT_STORAGE_KEY = "vec-effort";
 
-export const DEFAULT_EFFORT = 1;
+/**
+ * Deep, not Grounded. The first rung that has a model write the answer is the
+ * first one that sounds like an answer rather than a quoted sentence — and a
+ * spoken reply is already a network round trip to a model, so the 200 ms
+ * budget rungs 0–1 protect was never the thing being spent here. The two
+ * rungs below stay one notch left for anyone who wants them.
+ */
+export const DEFAULT_EFFORT = 2;
 
 export function reviveEffort(raw: unknown): number | null {
   if (typeof raw !== "number" || !Number.isInteger(raw)) return null;

@@ -5,6 +5,7 @@ import { RotateCcw, TriangleAlert } from "lucide-react";
 
 import { ActivityFeed } from "@/components/activity-feed";
 import { AuroraOrb } from "@/components/aurora-orb";
+import { ToolCallCard } from "@/components/tool-call-card";
 import { TranscriptCard } from "@/components/transcript-card";
 import { TryAsking } from "@/components/try-asking";
 import { Waveform } from "@/components/waveform";
@@ -16,7 +17,6 @@ import {
 } from "@/hooks/use-voice-session";
 import { useConversation } from "@/lib/conversation";
 import { cn } from "@/lib/utils";
-import { useHandsFree } from "@/lib/voice-settings";
 import type { VoiceState } from "@/lib/types";
 
 /**
@@ -28,8 +28,7 @@ import type { VoiceState } from "@/lib/types";
  * the rail panels keep the full history for anyone who wants to read it back.
  */
 export function VoiceApp({ conversationId }: { conversationId?: string }) {
-  const [handsFree, setHandsFree] = useHandsFree();
-  const { record, answer, adopt } = useConversation();
+  const { record, answer, attach, adopt } = useConversation();
 
   // Log each finished exchange for the Conversations panel. The backend has
   // already filed the same turn under the same id; this is the optimistic
@@ -76,6 +75,7 @@ export function VoiceApp({ conversationId }: { conversationId?: string }) {
     remaining,
     providers,
     activity,
+    currentTools,
     exchanges,
     current,
     start,
@@ -83,10 +83,12 @@ export function VoiceApp({ conversationId }: { conversationId?: string }) {
     cancel,
     ask,
   } = useVoiceSession({
-    handsFree,
     onExchange: remember,
     conversationId,
     onConversation: remembered,
+    // Straight through: a finished call is already in the shape the thread
+    // stores, and it is held for its turn until `remember` files one above.
+    onTool: attach,
   });
 
   const orbState: VoiceState = speaking
@@ -131,28 +133,49 @@ export function VoiceApp({ conversationId }: { conversationId?: string }) {
    * stops the orb shifting the moment a take starts.
    *
    * Everything that grows unpredictably — the transcript, the activity log —
-   * is `fixed` to a corner from `md` up and costs this grid no height at all.
+   * is `fixed` to a corner from `lg` up and costs this grid no height at all.
    * What is left in the centre column is bounded copy, so the reserved halves
    * can be small and the whole stage fits without page scroll on a short
    * laptop. That is the real guarantee that the orb never moves: nothing in
    * the flow can push it, and the page it sits on has nowhere to scroll to.
    *
-   * Below `md` the transcript comes back into the column and needs room, so
-   * the halves stop being equal — the bottom one is floored at the card's
-   * height and the orb rides a little above centre. Unequal, but still fixed:
-   * both floors are reserved whether or not anything is in them.
+   * Below `lg` there are no free corners — a tablet is not wide enough to
+   * hold a 320px card either side of the orb without one of them landing on
+   * it — so the transcript comes back into the column and the activity log
+   * moves behind a drawer. The column needs room for it, so the halves stop
+   * being equal: the bottom one is floored at the card's height and the orb
+   * rides a little above centre. Unequal, but still fixed — both floors are
+   * reserved whether or not anything is in them.
+   *
+   * Below `lg` the bottom row is `minmax(0, 1fr)` — a *weight*, never a fixed
+   * floor. A floor there is what put the openers on top of the footer line on
+   * a 667px phone: 13rem reserved for the bottom row, out of the 189px left
+   * once the orb and the padding had taken theirs, and the grid simply
+   * overflowed its own bottom padding into the footer's band. With no floor
+   * the row takes what is left and the column inside it scrolls, so the stage
+   * cannot outgrow its box at any height. The orb still cannot move: both
+   * outer rows are `fr`, so their heights come from the viewport rather than
+   * from whatever the column happens to be holding. The 0.55 weight is what
+   * keeps the orb a little above centre, where the row below needs the room.
+   *
+   * The bottom padding is what the stage owes the fixed furniture below it:
+   * below `lg` the centred rail with the footer credit line above it (120px),
+   * from `lg` neither — the rail is back in its corner and the line no longer
+   * reaches the middle (48px).
+   *
+   * Padding is `pt`/`pb` rather than `py` on purpose. `py-12` at `sm` and
+   * `pb-32` at `max-lg` are the same property from two variants, and the
+   * cascade — not the intent — picks the winner: `sm:py-12` was quietly
+   * taking the bottom padding on every tablet back to 48px, leaving the rail
+   * sitting over the stage's own content box.
    */
   return (
-    <div className="relative grid h-dvh min-h-152 grid-rows-[minmax(3rem,1fr)_auto_minmax(15rem,1fr)] justify-items-center gap-9 px-6 py-12 max-md:pb-32 md:grid-rows-[minmax(7.5rem,1fr)_auto_minmax(7.5rem,1fr)]">
-      {/* fixed to its corner, so it costs the centred stack no height */}
+    <div className="relative grid h-dvh min-h-136 grid-rows-[minmax(2rem,0.55fr)_auto_minmax(0,1fr)] justify-items-center gap-6 px-4 pt-8 pb-30 sm:gap-9 sm:px-6 sm:pt-12 short:min-h-0 short:gap-4 short:pt-6 short:pb-28 lg:min-h-152 lg:grid-rows-[minmax(7.5rem,1fr)_auto_minmax(7.5rem,1fr)] lg:pb-12">
+      {/* out of flow either way — a fixed corner card from `lg`, a fixed
+          drawer trigger below it — so it costs the centred stack no height */}
       <ActivityFeed status={status} activity={activity} exchanges={exchanges} />
 
-      <StatusPill
-        status={status}
-        remaining={remaining}
-        handsFree={handsFree}
-        onHandsFree={() => setHandsFree(!handsFree)}
-      />
+      <StatusPill status={status} remaining={remaining} />
 
       <AuroraOrb
         state={orbState}
@@ -196,23 +219,36 @@ export function VoiceApp({ conversationId }: { conversationId?: string }) {
         )}
 
         {/*
-          Rendered here, but `md:fixed` — from `md` up it lifts out of the flow
-          into the bottom-left corner and this slot collapses to nothing. Only
-          on a phone, where there is no spare corner, does it stay in the
-          column and take height. Either way it holds the transcript alone: the
-          answer is audio, and the words it spoke stay in the Conversations
-          panel rather than racing the voice down the screen.
-        */}
-        <TranscriptCard
-          exchange={current}
-          status={status}
-          speaking={speaking}
-          onStop={cancel}
-        />
+          The bottom-left stack: what the agent ran, then what it heard.
 
-        {/* below `md` the openers step aside once there is a take to read */}
+          Rendered here, but `lg:fixed` — from `lg` up it lifts out of the flow
+          into the bottom-left corner and this slot collapses to nothing. On a
+          phone or tablet, where there is no spare corner, it stays in the
+          column and takes height.
+
+          Anchored by its `bottom` edge, so the transcript keeps the floor and
+          the tool card grows upward into empty space above it — no card in the
+          stack can move the orb, whichever of them is open. Order matters for
+          the same reason it does in a stack trace: the tools ran *before* the
+          answer, and both sit under the question they came from.
+
+          What is not here is the reply's text. The answer is audio, and the
+          words it spoke stay in the Conversations panel rather than racing the
+          voice down the screen.
+        */}
+        <div className="flex w-full flex-col gap-2 empty:hidden lg:fixed lg:bottom-5 lg:left-5 lg:z-40 lg:w-80">
+          <ToolCallCard calls={currentTools} status={status} />
+          <TranscriptCard
+            exchange={current}
+            status={status}
+            speaking={speaking}
+            onStop={cancel}
+          />
+        </div>
+
+        {/* below `lg` the openers step aside once there is a take to read */}
         {!listening && !working && !speaking && !error && (
-          <div className={cn("w-full", current && "max-md:hidden")}>
+          <div className={cn("w-full short:hidden", current && "max-lg:hidden")}>
             <TryAsking onPick={(text, language) => void ask(text, language)} disabled={working} />
           </div>
         )}
@@ -232,73 +268,45 @@ export function VoiceApp({ conversationId }: { conversationId?: string }) {
 
 /**
  * Floating state read-out above the orb, so the orb itself stays wordless.
- * At rest it carries the one control worth having up here: whether the mic
- * reopens by itself after each answer.
+ *
+ * Three states, and no control: at rest it says how to begin, while recording
+ * it counts the take down, and for everything between the take and the last
+ * word of the answer it says `Streaming` — because that is one continuous
+ * thing to a listener, not the three stages it is on the wire.
  */
 function StatusPill({
   status,
   remaining,
-  handsFree,
-  onHandsFree,
 }: {
   status: string;
   remaining: number;
-  handsFree: boolean;
-  onHandsFree: () => void;
 }) {
   const seconds = Math.ceil(remaining / 1000);
-  const live = status !== "idle" && status !== "error";
-
-  const label: Record<string, string> = {
-    connecting: "Connecting",
-    transcribing: "Sending to Sarvam Saaras",
-    thinking: "Writing the reply",
-    speaking: "Speaking",
-  };
+  const listening = status === "listening";
+  const resting = status === "idle" || status === "error";
 
   return (
     <div className="flex h-8 items-center self-end">
-      {live ? (
-        <span className="glass fade flex h-8 items-center gap-2 rounded-full px-3.5 text-[0.78rem] font-medium tracking-wide text-ink-muted">
-          <span
-            aria-hidden
-            className={
-              status === "listening"
-                ? "pulse-dot size-1.5 rounded-full bg-ink"
+      <span className="glass fade flex h-8 items-center gap-2 rounded-full px-3.5 text-[0.78rem] font-medium tracking-wide text-ink-muted">
+        <span
+          aria-hidden
+          className={
+            listening
+              ? "pulse-dot size-1.5 rounded-full bg-ink"
+              : resting
+                ? "size-1.5 rounded-full border border-line"
                 : "size-1.5 animate-pulse rounded-full bg-ink-soft"
-            }
-          />
-          {status === "listening" ? (
-            <span className="tabular-nums">
-              Recording · {String(Math.floor(seconds / 60)).padStart(1, "0")}:
-              {String(seconds % 60).padStart(2, "0")} left
-            </span>
-          ) : (
-            <span>{label[status] ?? "Working"}</span>
-          )}
-        </span>
-      ) : (
-        <button
-          type="button"
-          onClick={onHandsFree}
-          aria-pressed={handsFree}
-          /* `.glass-hover` reads the `aria-pressed` below — hands-free being
-             on is a state the pill is left in, not just one it passes through
-             under the cursor. */
-          className="glass glass-hover fade flex h-8 items-center gap-2 rounded-full px-3.5 text-[0.78rem] font-medium tracking-wide text-ink-muted"
-          title="Reopen the microphone as soon as the answer ends"
-        >
-          <span
-            aria-hidden
-            className={
-              handsFree
-                ? "size-1.5 rounded-full bg-ink"
-                : "size-1.5 rounded-full border border-line"
-            }
-          />
-          Hands-free {handsFree ? "on" : "off"}
-        </button>
-      )}
+          }
+        />
+        {listening ? (
+          <span className="tabular-nums">
+            Listening · {String(Math.floor(seconds / 60)).padStart(1, "0")}:
+            {String(seconds % 60).padStart(2, "0")} left
+          </span>
+        ) : (
+          <span>{resting ? "Tap to speak" : "Streaming"}</span>
+        )}
+      </span>
     </div>
   );
 }

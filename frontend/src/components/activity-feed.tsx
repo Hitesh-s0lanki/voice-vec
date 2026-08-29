@@ -10,11 +10,14 @@ import {
   Sparkles,
   TriangleAlert,
   Volume2,
+  Waves,
   Wrench,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 import { PanelHeading, PanelRule } from "@/components/panels/panel";
+import { Button } from "@/components/ui/button";
+import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import type { ActivityLine, Exchange, VoiceStatus } from "@/hooks/use-voice-session";
 import { cn } from "@/lib/utils";
 
@@ -43,25 +46,89 @@ const ICONS: Record<string, LucideIcon> = {
   turn: Check,
 };
 
-/**
- * Top-right corner: what the backend is doing.
- *
- * The orb has four states and cannot say more than "thinking" — which covers
- * retrieval, a tool call and the model itself, three things with very
- * different reasons for being slow. This card is where that distinction
- * lives: every step the server announces, in the order it started, newest
- * first, with the elapsed time it reported. What was actually said belongs to
- * the transcript and Conversations panels, not here.
- */
-export function ActivityFeed({
-  status,
-  activity,
-  exchanges,
-}: {
+type FeedProps = {
   status: VoiceStatus;
   activity: ActivityLine[];
   exchanges: Exchange[];
-}) {
+};
+
+/**
+ * What the backend is doing.
+ *
+ * The orb has four states and cannot say more than "thinking" — which covers
+ * retrieval, a tool call and the model itself, three things with very
+ * different reasons for being slow. This is where that distinction lives:
+ * every step the server announces, in the order it started, newest first,
+ * with the elapsed time it reported. What was actually said belongs to the
+ * transcript and Conversations panels, not here.
+ *
+ * From `lg` up it is a card pinned to the top-right corner, out of the flow
+ * so the step log can grow without touching the orb. Below that there is no
+ * spare corner — the log would grow straight down over the orb — so it moves
+ * behind a button in the same corner and opens as a drawer off the right
+ * edge. Same contents either way; only one of the two is ever mounted.
+ */
+export function ActivityFeed(props: FeedProps) {
+  return (
+    <>
+      <aside
+        aria-label="Activity"
+        // `max-h` keeps it off the transcript card in the opposite corner on
+        // a short laptop.
+        className="glass fixed top-5 right-5 z-40 hidden max-h-[calc(100dvh-2.5rem)] w-80 flex-col gap-2 overflow-hidden rounded-2xl p-2 lg:flex"
+      >
+        <FeedBody {...props} />
+      </aside>
+
+      <ActivityDrawer {...props} />
+    </>
+  );
+}
+
+/**
+ * The small-screen entry point: one glass button where the card would have
+ * been, carrying the live dot so a running pipeline is still visible from the
+ * stage without the log being open.
+ */
+function ActivityDrawer(props: FeedProps) {
+  const live = props.status !== "idle" && props.status !== "error";
+
+  return (
+    <Sheet>
+      <SheetTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-lg"
+          className="glass fixed top-4 right-4 z-40 rounded-xl text-ink-muted sm:top-5 sm:right-5 lg:hidden"
+        >
+          {live ? (
+            <span
+              aria-hidden
+              className="pulse-dot size-2 rounded-full bg-ink"
+            />
+          ) : (
+            <Waves aria-hidden className="size-[1.15rem]" />
+          )}
+          <span className="sr-only">Activity</span>
+        </Button>
+      </SheetTrigger>
+
+      <SheetContent
+        side="right"
+        title="Activity"
+        // The drawer is as tall as the screen, so unlike the corner card the
+        // list has real room — it gets the scroll rather than the panel.
+        className="gap-2 p-2 pt-3"
+      >
+        <FeedBody {...props} />
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+/** Heading, rule and the step list — the part both presentations share. */
+function FeedBody({ status, activity, exchanges }: FeedProps) {
   const live = status !== "idle" && status !== "error";
 
   // Steps arrive in pipeline order and each one keeps the slot it started in,
@@ -70,15 +137,7 @@ export function ActivityFeed({
   const waiting = live ? WAITING[status] : undefined;
 
   return (
-    <aside
-      aria-label="Activity"
-      /*
-        Hidden below `md`: on a phone the step log grows straight down over the
-        orb. `max-h` keeps it off the transcript card in the opposite corner on
-        a short laptop.
-      */
-      className="glass fixed top-5 right-5 z-40 hidden max-h-[calc(100dvh-2.5rem)] w-80 flex-col gap-2 overflow-hidden rounded-2xl p-2 md:flex"
-    >
+    <>
       <PanelHeading
         title="Activity"
         hint={
@@ -100,7 +159,7 @@ export function ActivityFeed({
       ) : (
         <ul
           aria-live="polite"
-          className="flex min-h-0 flex-col gap-0.5 overflow-y-auto"
+          className="flex min-h-0 flex-col gap-0.5 overflow-y-auto scrollbar-thin"
         >
           {/*
             The client's own state, shown only until the server's first step
@@ -120,7 +179,7 @@ export function ActivityFeed({
           ))}
         </ul>
       )}
-    </aside>
+    </>
   );
 }
 

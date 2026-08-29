@@ -1,6 +1,7 @@
 {
   "name": "voice-vec",
   "version": "0.1.0",
+  "description": "Vec — a voice interface that hears twenty-two Indian languages and answers out loud in the one you spoke.",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3002",

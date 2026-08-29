@@ -48,12 +48,12 @@ export type ChatMessage = {
 };
 
 /**
- * One tool the agent ran, as the thread shows it.
+ * One tool the agent ran, as the thread shows it: both halves of the call.
  *
- * There is no `result` field and that is deliberate, not an omission: the
- * backend stores a result's *size* and never its content, so an audit trail
- * cannot become a copy of everything the agent has read. What is here is what
- * the agent decided — the tool and its arguments — plus how it went.
+ * `arguments` is what the agent decided; `result` is the head of what came
+ * back. The result is a *preview* — the backend stores the first few thousand
+ * characters and keeps `resultBytes` as the size of the whole, so a card can
+ * say how much of it is on screen rather than implying it is all there.
  */
 export type ToolCall = {
   id: string;
@@ -66,6 +66,9 @@ export type ToolCall = {
   status: string;
   ok: boolean;
   error: string | null;
+  /** Bounded, and marked "… (truncated)" by the backend when it was cut. */
+  result: string | null;
+  /** The size of the whole result, which `result` may only be the head of. */
   resultBytes: number | null;
   latencyMs: number | null;
   createdAt: string;

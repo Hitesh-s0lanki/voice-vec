@@ -4,19 +4,16 @@ import { useEffect, useState } from "react";
 
 import { PanelChip, PanelHeading, PanelRule } from "@/components/panels/panel";
 import { MAX_RECORDING_MS } from "@/hooks/use-voice-session";
-import { useHandsFree } from "@/lib/voice-settings";
 import { voiceHttpUrl, type Providers } from "@/lib/voice-protocol";
-import { cn } from "@/lib/utils";
 
 /**
- * One switch, and a read-out of what is actually answering.
+ * A read-out of what is actually listening, answering and speaking.
  *
  * The providers are asked for rather than hard-coded, because which one speaks
  * depends on which key the backend was started with — and "why is it replying
  * in an English voice" is exactly the question this panel should answer.
  */
 export function SettingsPanel() {
-  const [handsFree, setHandsFree] = useHandsFree();
   const [providers, setProviders] = useState<Providers | null>(null);
 
   useEffect(() => {
@@ -41,29 +38,6 @@ export function SettingsPanel() {
       <PanelRule />
 
       <dl className="flex flex-col gap-0.5">
-        <Row label="Hands-free">
-          <button
-            type="button"
-            role="switch"
-            aria-checked={handsFree}
-            onClick={() => setHandsFree(!handsFree)}
-            title="Reopen the microphone as soon as the answer ends"
-            className={cn(
-              "relative h-5 w-9 rounded-full border border-line transition-colors hover:border-line-strong",
-              // off is a groove cut into the panel; on fills it with ink
-              handsFree ? "bg-ink/78" : "glass-track",
-            )}
-          >
-            <span
-              aria-hidden
-              className={cn(
-                "absolute top-0.5 size-3.5 rounded-full bg-shell shadow-sm transition-all",
-                handsFree ? "left-4.5" : "left-0.5",
-              )}
-            />
-          </button>
-        </Row>
-
         <Row label="Take length">
           <span className="text-[0.75rem] tabular-nums text-ink-soft">
             {Math.round(MAX_RECORDING_MS / 1000)}s
@@ -98,10 +72,6 @@ export function SettingsPanel() {
 
         <Row label="Language">
           <span className="text-[0.75rem] text-ink-soft">Auto-detected</span>
-        </Row>
-
-        <Row label="Retrieval">
-          <PanelChip>{providers?.ragEnabled ? "on" : "off"}</PanelChip>
         </Row>
 
         {/*

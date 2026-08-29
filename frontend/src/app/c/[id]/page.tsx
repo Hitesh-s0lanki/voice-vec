@@ -1,4 +1,18 @@
+import type { Metadata } from "next";
+
 import { VoiceApp } from "@/components/voice-app";
+
+/**
+ * Every saved thread is somebody's, and the id in the URL is the only thing
+ * guarding it — so the title says nothing about what is inside and the page
+ * stays out of every index.
+ */
+export const metadata: Metadata = {
+  title: "Conversation",
+  description: "A saved voice conversation, reopened where it left off.",
+  robots: { index: false, follow: false, nocache: true },
+};
+
 
 /**
  * One conversation, at its own address.
