@@ -25,7 +25,13 @@ import pytest
 from fastapi import HTTPException
 
 from src.controllers.connectors_controller import require_user
-from src.services.integration_service import IntegrationService, _slug
+from src.agents.tool_agent import ToolAgent
+from src.services.integration_service import (
+    IntegrationError,
+    IntegrationService,
+    _slug,
+    _tool_name,
+)
 
 
 class FakeVerifier:
@@ -175,3 +181,186 @@ class TestPairs:
 
     def test_survives_a_response_with_no_items(self):
         assert self._pairs(None) == []
+
+
+def _agent(schemas: list[dict]) -> ToolAgent:
+    """A ToolAgent with the Composio round trip taken out.
+
+    `inventory` is the thing under test and it reads whatever `tools_for`
+    returns, so the fake replaces exactly that and nothing else.
+    """
+    agent = ToolAgent.__new__(ToolAgent)
+    agent.tools_for = lambda user_id: schemas  # type: ignore[method-assign]
+    return agent
+
+
+class TestToolInventory:
+    """What the panel says the agent can do has to be what it *would* be
+    handed — read back through the same call the turn makes."""
+
+    def test_tools_are_grouped_by_their_toolkit(self):
+        agent = _agent(
+            [
+                {"type": "function", "function": {"name": "GMAIL_SEND_EMAIL"}},
+                {"type": "function", "function": {"name": "GMAIL_FETCH_EMAILS"}},
+                {"type": "function", "function": {"name": "SLACK_POST_MESSAGE"}},
+            ]
+        )
+        inventory = agent.inventory("u1")
+
+        assert sorted(inventory) == ["gmail", "slack"]
+        assert len(inventory["gmail"]) == 2
+
+    def test_a_flat_schema_is_read_as_well_as_a_nested_one(self):
+        """The gateway path builds the shape by hand; a panel is not worth a
+        KeyError over which of the two it built."""
+        inventory = _agent([{"name": "NOTION_CREATE_PAGE", "description": "d"}]).inventory("u1")
+
+        assert inventory["notion"][0]["slug"] == "NOTION_CREATE_PAGE"
+
+    @pytest.mark.parametrize("schema", [{}, {"function": {"name": ""}}, "not a dict"])
+    def test_a_schema_with_no_name_is_skipped_not_raised(self, schema):
+        assert _agent([schema]).inventory("u1") == {}
+
+    def test_the_service_reports_the_total_and_whether_it_was_capped(self):
+        service = IntegrationService(
+            clients=None,
+            store=None,
+            settings=SimpleNamespace(tool_schema_limit=3),
+            agent=_agent(
+                [
+                    {"function": {"name": "GMAIL_SEND_EMAIL", "description": "  Sends  mail. "}},
+                    {"function": {"name": "GMAIL_FETCH_EMAILS"}},
+                    {"function": {"name": "SLACK_POST_MESSAGE"}},
+                ]
+            ),
+        )
+        inventory = service.tools("u1")
+
+        assert inventory.total == 3
+        # Equal to the limit is the only sign there may be more behind it.
+        assert inventory.limited is True
+        assert [kit.toolkit for kit in inventory.toolkits] == ["gmail", "slack"]
+
+        # Sorted by slug inside a toolkit, so the list does not reshuffle
+        # between panel opens as Composio's own order changes.
+        gmail = inventory.toolkits[0]
+        assert [tool.slug for tool in gmail.tools] == [
+            "GMAIL_FETCH_EMAILS",
+            "GMAIL_SEND_EMAIL",
+        ]
+        assert gmail.tools[1].description == "Sends mail."
+
+    def test_an_unreadable_inventory_empties_the_section_rather_than_the_panel(self):
+        broken = ToolAgent.__new__(ToolAgent)
+
+        def raise_it(user_id):
+            raise RuntimeError("composio is down")
+
+        broken.tools_for = raise_it  # type: ignore[method-assign]
+        service = IntegrationService(
+            clients=None, store=None, settings=SimpleNamespace(tool_schema_limit=40), agent=broken
+        )
+
+        assert service.tools("u1").total == 0
+
+
+class TestGatewayReconcile:
+    """The gateway has no "list everything" call, so what it is asked matters.
+
+    Asking only about rows already on file made the panel a mirror of its own
+    database: a toolkit linked in the Composio dashboard, or on the same key
+    from anywhere else, never appeared — so the panel offered to link a service
+    that was already linked, and the voice turn got no tools for it.
+    """
+
+    class Store:
+        def __init__(self, rows=()):
+            self.rows = [
+                SimpleNamespace(toolkit=toolkit, status=status) for toolkit, status in rows
+            ]
+            self.reconciled = None
+            self.sees_pending = None
+
+        def list(self, user_id):
+            return self.rows
+
+        def reconcile(self, user_id, live, *, sees_pending=True):
+            self.reconciled = list(live)
+            self.sees_pending = sees_pending
+
+    class Gateway:
+        def __init__(self, answers):
+            self.answers = answers
+            self.asked = None
+
+        def connections(self, toolkits):
+            self.asked = list(toolkits)
+            return [pair for pair in self.answers if pair[0] in self.asked]
+
+    def _service(self, store, sampled=()):
+        service = IntegrationService(clients=None, store=store, settings=SimpleNamespace())
+        service.catalog = lambda user_id, **_: SimpleNamespace(  # type: ignore[method-assign]
+            toolkits=[SimpleNamespace(slug=slug) for slug in sampled]
+        )
+        return service
+
+    def test_asks_about_the_catalogue_sample_and_not_only_its_own_rows(self):
+        store = self.Store([("gmail", "ACTIVE")])
+        gateway = self.Gateway([("gmail", "gmail_a", "ACTIVE"), ("github", "github_b", "ACTIVE")])
+
+        self._service(store, sampled=["gmail", "github", "slack"])._reconcile_gateway(
+            "u1", gateway
+        )
+
+        assert gateway.asked == ["github", "gmail", "slack"]
+        # GitHub was linked outside this app and is now on file.
+        assert ("github", "github_b", "ACTIVE") in store.reconciled
+
+    def test_an_accountless_answer_about_an_unknown_toolkit_is_not_a_connection(self):
+        """Otherwise a search result becomes a row nobody asked for."""
+        store = self.Store()
+        gateway = self.Gateway([("slack", "", "FAILED")])
+
+        self._service(store, sampled=["slack"])._reconcile_gateway("u1", gateway)
+
+        assert store.reconciled == []
+
+    def test_an_accountless_answer_about_a_known_toolkit_still_counts(self):
+        store = self.Store([("slack", "ACTIVE")])
+        gateway = self.Gateway([("slack", "", "FAILED")])
+
+        self._service(store, sampled=[])._reconcile_gateway("u1", gateway)
+
+        assert store.reconciled == [("slack", "", "FAILED")]
+
+    def test_tells_the_store_it_cannot_see_a_consent_in_flight(self):
+        """The gateway reports accounts, and consent in flight has none."""
+        store = self.Store([("gmail", "INITIALIZING")])
+
+        self._service(store)._reconcile_gateway("u1", self.Gateway([]))
+
+        assert store.sees_pending is False
+
+    def test_a_dead_catalogue_costs_discovery_and_not_the_reconcile(self):
+        store = self.Store([("gmail", "ACTIVE")])
+        gateway = self.Gateway([("gmail", "gmail_a", "ACTIVE")])
+
+        service = IntegrationService(clients=None, store=store, settings=SimpleNamespace())
+
+        def raise_it(user_id, **_):
+            raise IntegrationError("Composio did not answer")
+
+        service.catalog = raise_it  # type: ignore[method-assign]
+        service._reconcile_gateway("u1", gateway)
+
+        assert gateway.asked == ["gmail"]
+        assert store.reconciled == [("gmail", "gmail_a", "ACTIVE")]
+
+
+class TestToolNames:
+    def test_the_toolkit_prefix_is_dropped_for_the_label(self):
+        assert _tool_name("GMAIL_SEND_EMAIL", "gmail") == "Send email"
+
+    def test_a_slug_that_does_not_carry_its_toolkit_keeps_its_words(self):
+        assert _tool_name("SEARCH_DOCS", "notion") == "Search docs"

@@ -40,6 +40,7 @@ from src.schemas.integrations import (
     Connection,
     ConnectionList,
     Disconnected,
+    ToolInventory,
     ToolkitList,
 )
 from src.services.integration_service import (
@@ -101,6 +102,24 @@ def list_toolkits(
         return service.catalog(user_id, search=search, cursor=cursor, limit=limit)
     except IntegrationError as error:
         raise _handle(error) from error
+
+
+@router.get(
+    "/tools",
+    response_model=ToolInventory,
+    summary="What your linked services let the agent do",
+)
+def list_tools(service: ServiceDep, user_id: UserDep) -> ToolInventory:
+    """The tools the model would be handed on the next turn, by toolkit.
+
+    A static segment, so it resolves ahead of `/{toolkit}` below — `tools` is
+    a perfectly good toolkit slug as far as a path parameter is concerned.
+
+    Empty rather than 409 when Composio is not attached: this hangs under the
+    Composio detail view, which is only reachable once it is, and a panel
+    section is not worth an error page.
+    """
+    return service.tools(user_id)
 
 
 @router.get("", response_model=ConnectionList, summary="Your connected accounts")

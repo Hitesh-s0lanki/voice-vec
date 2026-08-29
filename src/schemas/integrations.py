@@ -44,6 +44,41 @@ class ToolkitList(Wire):
     next_cursor: str | None = None
 
 
+class Tool(Wire):
+    """One action the model can ask for, as the panel lists it."""
+
+    slug: str = Field(description="Composio's own, e.g. GMAIL_SEND_EMAIL")
+    name: str = Field(description="The slug with its toolkit prefix off, in words")
+    description: str | None = Field(
+        default=None, description="Composio's, trimmed to a line the panel can hold"
+    )
+
+
+class ToolkitTools(Wire):
+    """What one linked service actually gives the agent."""
+
+    toolkit: str
+    tools: list[Tool] = []
+    count: int = Field(default=0, description="How many, in case the list is capped")
+
+
+class ToolInventory(Wire):
+    """Everything this account can be handed on the next turn.
+
+    Not the catalogue's tool counts — those say what a toolkit *has*. This is
+    read back through the same call the voice turn makes, so it is bounded by
+    `tool_schema_limit` and by which connections reconciled as ACTIVE, and it
+    is the honest answer to "what can it do for me".
+    """
+
+    toolkits: list[ToolkitTools] = []
+    total: int = 0
+    limited: bool = Field(
+        default=False,
+        description="The per-turn schema limit was reached — there may be more",
+    )
+
+
 class Connection(Wire):
     """A service this account has connected."""
 

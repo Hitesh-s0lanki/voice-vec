@@ -18,6 +18,20 @@ lives inside one Composio project. User A's `ac_…` is not a thing user B's
 Composio has ever heard of, so `integration_auth_configs` is keyed by both and
 `_auth_config` creates one in whichever project it is talking to.
 
+**Two transports, one contract.** A platform key (`ak_…`) reaches Composio's
+REST API through the SDK; a gateway key (`ck_…`) reaches one JSON-RPC endpoint
+and no REST at all. Every public method below branches once, at the top, on
+which client `_sdk` handed back, and both branches produce the same wire
+shapes — so the panel, the store and the voice path never learn which one a
+given user connected with.
+
+The branches are not symmetric, and two differences are worth stating rather
+than hiding. The gateway owns its auth configs, so `connect()` skips the whole
+`_auth_config`/`_start` dance and asks for a consent URL directly. And the
+gateway has no catalogue listing — only a semantic search — so `catalog()`
+returns what a search found, with no cursor and no logos. See
+`src/integrations/mcp.py`.
+
 **`link()`, not `initiate()`.** Composio retired `initiate()` for its own
 managed OAuth apps — blocked for new organisations from 2026-05-08 and for
 everybody from 2026-07-03, both in the past. Calling it on a managed auth
@@ -40,11 +54,13 @@ from composio import Composio
 
 from src.core.config import Settings, get_settings
 from src.integrations.client import (
+    Client,
     ComposioClients,
     ComposioUnavailable,
     NotConnected,
     get_clients,
 )
+from src.integrations.mcp import ComposioGateway, GatewayError
 from src.integrations.store import (
     ACTIVE,
     PENDING,
@@ -52,16 +68,48 @@ from src.integrations.store import (
     IntegrationStore,
     get_integration_store,
 )
+from src.agents.tool_agent import ToolAgent, get_agent
 from src.schemas.integrations import (
     ConnectStarted,
     Connection,
     ConnectionList,
+    Tool,
+    ToolInventory,
     Toolkit,
     ToolkitList,
+    ToolkitTools,
 )
 
 log = logging.getLogger("vec.integrations")
 
+
+
+#: A Composio description runs to a paragraph and the panel gives it one line.
+MAX_TOOL_DESCRIPTION = 140
+
+
+def _tool_name(slug: str, toolkit: str) -> str:
+    """`GMAIL_SEND_EMAIL` under `gmail` → `Send email`.
+
+    The toolkit prefix is dropped because the row it renders in is already the
+    toolkit — repeating it costs the half of the line that says what the tool
+    does. The slug stays on the wire beside it, since that is what shows up in
+    a conversation's tool call and what somebody would search Composio for.
+    """
+    rest = slug[len(toolkit) + 1 :] if slug.lower().startswith(f"{toolkit}_") else slug
+    words = rest.replace("_", " ").strip().lower()
+    return words[:1].upper() + words[1:] if words else slug
+
+
+def _one_line(text: str | None) -> str | None:
+    """First sentence-ish, capped. Composio's descriptions are docstrings."""
+    if not text:
+        return None
+
+    line = " ".join(str(text).split())
+    if len(line) <= MAX_TOOL_DESCRIPTION:
+        return line
+    return line[: MAX_TOOL_DESCRIPTION - 1].rstrip() + "…"
 
 
 class IntegrationError(RuntimeError):
@@ -103,10 +151,17 @@ class IntegrationService:
         clients: ComposioClients,
         store: IntegrationStore,
         settings: Settings,
+        agent: ToolAgent | None = None,
     ) -> None:
         self._clients = clients
         self._store = store
         self._settings = settings
+        # The same agent the voice turn uses, deliberately: the panel should
+        # report what the model would actually be handed, cache and limit
+        # included, not a second opinion assembled next to it. Resolved on
+        # first use rather than here, so constructing this service stays free
+        # for the paths that never ask what the tools are.
+        self._agent = agent
         # (user_id, cursor, search) → (fetched_at, payload). Keyed by user
         # because it is fetched with that user's key against that user's
         # project — a shared cache here would serve one person's Composio to
@@ -118,7 +173,7 @@ class IntegrationService:
         """Whether this deployment can hold a Composio key at all."""
         return self._clients.configured
 
-    def _sdk(self, user_id: str) -> Composio:
+    def _sdk(self, user_id: str) -> Client:
         """This user's Composio, or an `IntegrationError` the panel can render.
 
         The three failures are deliberately different status codes: 409 is
@@ -149,6 +204,49 @@ class IntegrationService:
             log.warning("could not purge Composio rows for %s: %s", user_id, error)
             return 0
 
+    # ---- what the agent can do ------------------------------------------
+
+    def tools(self, user_id: str) -> ToolInventory:
+        """The tools this account's linked services give the agent.
+
+        Never raises. A panel section that says "couldn't read that" is worth
+        more than a 502 over the whole Connectors panel, and the tool pass
+        itself already treats an unreadable schema list as "no tools" rather
+        than as a failure — this reports the same thing the turn would see.
+        """
+        agent = self._agent or get_agent()
+
+        try:
+            grouped = agent.inventory(user_id)
+        except Exception as error:  # pragma: no cover — defensive
+            log.warning("could not read the tool inventory for %s: %s", user_id, error)
+            return ToolInventory()
+
+        toolkits = [
+            ToolkitTools(
+                toolkit=toolkit,
+                count=len(tools),
+                tools=[
+                    Tool(
+                        slug=tool["slug"] or "",
+                        name=_tool_name(tool["slug"] or "", toolkit),
+                        description=_one_line(tool.get("description")),
+                    )
+                    for tool in tools
+                ],
+            )
+            for toolkit, tools in sorted(grouped.items())
+        ]
+        total = sum(kit.count for kit in toolkits)
+
+        return ToolInventory(
+            toolkits=toolkits,
+            total=total,
+            # Equal, not greater: the limit is what was asked of Composio, so
+            # hitting it exactly is the one observable sign there may be more.
+            limited=total >= self._settings.tool_schema_limit,
+        )
+
     # ---- catalogue ------------------------------------------------------
 
     def catalog(
@@ -166,6 +264,11 @@ class IntegrationService:
         cached = self._catalog.get(key)
         if cached and time.monotonic() - cached[0] < self._settings.composio_catalog_ttl_s:
             return cached[1]
+
+        if isinstance(sdk, ComposioGateway):
+            payload = self._gateway_catalog(sdk, search, limit)
+            self._catalog[key] = (time.monotonic(), payload)
+            return payload
 
         query: dict[str, Any] = {"limit": limit, "sort_by": "usage"}
         if search.strip():
@@ -187,6 +290,39 @@ class IntegrationService:
         )
         self._catalog[key] = (time.monotonic(), payload)
         return payload
+
+    def _gateway_catalog(self, sdk: ComposioGateway, search: str, limit: int) -> ToolkitList:
+        """The catalogue as a semantic search, which is all the gateway has.
+
+        Deliberately sparse. The REST catalogue carries a description, a logo,
+        a category list and a tool count; the gateway carries a slug. Filling
+        the rest in from guesswork would put invented copy on a panel that
+        looks authoritative, so the fields stay empty and the row renders as a
+        name — and `next_cursor` stays null because there is no page two to
+        ask for, only a different search.
+        """
+        try:
+            found = sdk.search_toolkits(search, limit=limit)
+        except GatewayError as error:
+            log.warning("gateway catalogue search failed: %s", error)
+            raise IntegrationError("Composio did not answer — try again in a moment.") from error
+
+        return ToolkitList(
+            toolkits=[
+                Toolkit(
+                    slug=entry["slug"],
+                    name=entry["slug"].replace("_", " ").replace("-", " ").title(),
+                    # The gateway creates the auth config itself on connect, so
+                    # everything it names is connectable without dashboard setup
+                    # — the one thing this path knows that the REST path cannot
+                    # assume.
+                    connectable=True,
+                )
+                for entry in found
+                if entry.get("slug")
+            ],
+            next_cursor=None,
+        )
 
     def _toolkit(self, item: Any) -> Toolkit:
         managed = list(getattr(item, "composio_managed_auth_schemes", None) or [])
@@ -289,6 +425,26 @@ class IntegrationService:
             raise IntegrationError("That is not a toolkit.", status_code=400)
 
         sdk = self._sdk(user_id)
+
+        if isinstance(sdk, ComposioGateway):
+            # No auth config to find, create or repair: the gateway keeps its
+            # own and hands back consent directly. The row is still written
+            # before the URL goes out, for the same reason as below.
+            try:
+                redirect_url, status = sdk.add_connection(slug)
+            except GatewayError as error:
+                log.warning("could not start a %s connection for %s: %s", slug, user_id, error)
+                raise IntegrationError(f"Composio would not start a {slug} connection.") from error
+
+            self._store.open(
+                user_id=user_id,
+                toolkit=slug,
+                auth_config_id="",
+                connected_account_id=None,
+                status=status,
+            )
+            return ConnectStarted(toolkit=slug, redirect_url=redirect_url, status=status)
+
         auth_config_id, managed = self._auth_config(sdk, user_id, slug)
 
         try:
@@ -370,8 +526,11 @@ class IntegrationService:
             raise
 
         try:
-            live = sdk.connected_accounts.list(user_ids=[user_id])
-            self._store.reconcile(user_id, self._pairs(live))
+            if isinstance(sdk, ComposioGateway):
+                self._reconcile_gateway(user_id, sdk)
+            else:
+                live = sdk.connected_accounts.list(user_ids=[user_id])
+                self._store.reconcile(user_id, self._pairs(live))
         except Exception as error:
             log.warning("could not reconcile connections for %s: %s", user_id, error)
 
@@ -381,6 +540,50 @@ class IntegrationService:
             connections=[self._connection(row, names) for row in rows],
             configured=True,
         )
+
+    def _reconcile_gateway(self, user_id: str, sdk: ComposioGateway) -> None:
+        """The same reconcile, against a transport with no "list everything".
+
+        The gateway answers about toolkits it is *asked* about. Asking only
+        about what is already on file — which is what this did — makes the
+        panel a mirror of its own database: a toolkit connected anywhere else
+        on the same key (the Composio dashboard, another client, this app
+        before its rows were reset) never appears, so the panel offers to link
+        a service that is already linked, and the voice turn is handed no tools
+        for it because `ToolAgent` reads the same ACTIVE rows.
+
+        So the question is asked about what is on file *and* what the gateway's
+        own search surfaces. That makes it a sample rather than a census, and
+        the honest consequence is that a toolkit outside the sample stays
+        invisible until it is searched for — but the sample covers what the
+        catalogue shows, which is where somebody would go to link it anyway.
+
+        The catalogue call is the one the panel already makes, cached per user
+        on a TTL, so an open panel pays for it once rather than once per read.
+        """
+        known = {row.toolkit for row in self._store.list(user_id)}
+
+        try:
+            sampled = {kit.slug for kit in self.catalog(user_id).toolkits}
+        except IntegrationError as error:
+            # Discovery is the bonus half. Losing it costs the toolkits nobody
+            # here has a row for, and the rest of the reconcile still runs.
+            log.info("gateway catalogue sample failed for %s: %s", user_id, error)
+            sampled = set()
+
+        asked = sorted(known | sampled)
+        if not asked:
+            return
+
+        live = [
+            (toolkit, account_id, status)
+            for toolkit, account_id, status in sdk.connections(asked)
+            # An accountless answer is only news about a toolkit we already
+            # have a row for. For one that came out of the sample it would be
+            # this app inventing a connection out of a search result.
+            if account_id or toolkit in known
+        ]
+        self._store.reconcile(user_id, live, sees_pending=False)
 
     def _pairs(self, response: Any) -> Iterable[tuple[str, str, str]]:
         """(toolkit, account id, status) out of a Composio list response.
@@ -445,8 +648,12 @@ class IntegrationService:
 
         try:
             sdk = self._sdk(user_id)
-            live = sdk.connected_accounts.list(user_ids=[user_id], toolkit_slugs=[slug])
-            for found_slug, account_id, status in self._pairs(live):
+            if isinstance(sdk, ComposioGateway):
+                pairs: Iterable[tuple[str, str, str]] = sdk.connections([slug])
+            else:
+                live = sdk.connected_accounts.list(user_ids=[user_id], toolkit_slugs=[slug])
+                pairs = self._pairs(live)
+            for found_slug, account_id, status in pairs:
                 if found_slug == slug:
                     row = (
                         self._store.mark(
@@ -479,7 +686,11 @@ class IntegrationService:
 
         if row.connected_account_id:
             try:
-                self._sdk(user_id).connected_accounts.delete(row.connected_account_id)
+                sdk = self._sdk(user_id)
+                if isinstance(sdk, ComposioGateway):
+                    sdk.remove_connection(slug, row.connected_account_id)
+                else:
+                    sdk.connected_accounts.delete(row.connected_account_id)
             except IntegrationError:
                 raise
             except Exception as error:
