@@ -68,6 +68,7 @@ a measured number on thousands of queries rather than a demo that worked once.
 21. **[21-agents.md](21-agents.md)** — one package for the agents, one contract under them, and LangChain under that: what counts as an agent here, the three promises `BaseAgent` holds, the one real tool loop, and the prompt files in [`src/prompts/`](../src/prompts/), and the tools in [`src/tools/`](../src/tools/)
 22. **[22-no-local-corpus.md](22-no-local-corpus.md)** — removing the deployment's own index: what a fallback corpus was hiding, why "nothing connected" is an answer rather than an error, and everything that came out with it
 23. **[23-capabilities.md](23-capabilities.md)** — what the agent can reach, as a tool instead of a prompt: `find_capability` searches the measured cards, and what it names unlocks the tool that acts on it
+24. **[24-deploy.md](24-deploy.md)** — the container and the two pipelines: why the embedding model is baked into the image, what the entrypoint does at boot, and what each CI job actually proves
 
 ## Background research
 

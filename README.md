@@ -34,6 +34,14 @@ while it is still being written — and talking over it stops it mid-word.
 > embedded at that store's own width.
 > [`docs/13a-cross-lingual.md`](docs/13a-cross-lingual.md) measures what that costs.
 
+Connecting is what turns that into leverage. A vector store makes your own passages
+answerable out loud; a pasted dataset URL makes rows nobody embedded answerable in SQL; a
+linked Gmail or Slack makes a spoken sentence *do* something. And the agent is never handed a
+list of what you have — it holds one discovery tool and goes looking, so the prompt grows
+with the question rather than with the account.
+[**What a question can reach**](#connectors-what-a-question-can-reach) is that flow, end to
+end.
+
 > [!NOTE]
 > One caveat before the latency numbers below. The 200 ms budget in
 > [`docs/04-latency.md`](docs/04-latency.md) was measured against an in-process index. Over
@@ -45,7 +53,7 @@ while it is still being written — and talking over it stops it mid-word.
 - [Quickstart](#quickstart) — two keys, no index, no Docker
 - [The spoken loop](#the-spoken-loop) — what happens between the tap and the sound
 - [Conversations, and what carries between them](#conversations-and-what-carries-between-them)
-- [Connectors: your store, your tools](#connectors-your-store-your-tools)
+- [Connectors: what a question can reach](#connectors-what-a-question-can-reach) — your store, your datasets, your tools, and how the agent finds them
 - [The effort ladder](#the-effort-ladder) — five retrieval architectures on one slider
 - [API surface](#api-surface)
 - [Repo layout](#repo-layout)
@@ -189,29 +197,169 @@ one 30 MB instance without evicting each other.
 | What the agent remembers between conversations | [`src/memory/store.py`](src/memory/store.py), [`docs/16-memory.md`](docs/16-memory.md) |
 | The answer cache, in Redis | [`src/rag/cache.py`](src/rag/cache.py) |
 
-## Connectors: your store, your tools
+## Connectors: what a question can reach
 
-Signing in unlocks the Connectors panel, where **you attach services with your own
-credentials** — none are baked into this server. Composio links Gmail, Slack or Notion into
-*your* Composio project; Pinecone, Astra or your own Postgres becomes where *your* questions
-get searched.
+With nothing attached, Vec is a voice loop over a model — it hears twenty-two languages,
+answers in the one it heard, and says *"I don't have a source to search yet"* rather than
+inventing one. Attaching something does not change how any of that sounds. It changes what a
+question is allowed to **reach**.
 
-Once a toolkit is linked, a spoken turn can actually **run** it — the agent decides, calls,
-and then answers from what came back, and every call is written down beside the turn that
-caused it. Credentials are encrypted before they reach Postgres and only ever come back as
-their last four characters. Adding a connector is a backend change: each one declares its own
-fields and the panel builds the form from that. Those routes are the one part of the app with
-no anonymous path through them — a saved conversation belongs to whoever holds the browser,
-but a credential does not. [`docs/13-connectors.md`](docs/13-connectors.md) is how.
+Signing in unlocks the Connectors panel, and every credential in it is **yours**. None are
+baked into this server, everything runs inside your own project, and two people share no
+connector state at all.
+
+| You attach | With | And a spoken question can then |
+| --- | --- | --- |
+| **Pinecone**, **Astra**, or your own **Postgres + pgvector** | your key, your index | be answered out of passages from *your* index — asked in any of the 22 languages, whatever the index was written in |
+| **A dataset** — a HuggingFace repo, or any `.parquet` / `.csv` URL | paste the URL | be answered in **SQL** — counts, `GROUP BY`, averages over rows nobody embedded |
+| **Gmail, Slack, Notion, GitHub…** | your own Composio project | be *carried out* — fetch the inbox, open the issue, send the message |
+
+Those are not three flavours of retrieval. One looks things up, one computes, one has effects
+outside this app — and a single turn picks whichever fits, chosen by the question rather than
+by a setting.
+
+<div align="center">
+<img src="images/dataset-connector.png" alt="The Dataset connector open beside the orb: two attached datasets, Titanic Passenger Records at 891 rows and IMDB Review Sentiment at 75,000 rows across 3 tables, with a URL box and quick-attach chips" width="900">
+</div>
+
+### Two clocks
+
+Understanding a connected thing is slow — a network pull, a measurement, a model call.
+Answering has to be fast, because somebody is listening through it. So the expensive half
+runs **once, on a worker thread, off every request path**, and every turn afterwards reads a
+row that is already there.
+
+```
+ATTACH TIME — once, and nothing waits for it
+  PUT /connectors/{slug} {values}
+        │
+        ├─ clean    drop undeclared keys, insist on required ones
+        ├─ verify   ONE real authenticated call — a wrong key is caught at the form
+        ├─ seal     Fernet over the whole credential set, master key never in the DB
+        └─ store    ──► 200, the form goes green
+                     │
+                     └─ schedule() ─────────────────────────────► worker thread
+                            │
+                probe ──────┴────── narrate ────────── derive
+          sample the real store   one LLM call over    coverage → what a
+          (200 records, bounded)   the excerpts        query may actually do
+                            │
+                            ▼
+                    connector_profiles / agent_datasets
+────────────────────────────┼──────────────────────────────────────────────────
+TURN TIME — inside a question somebody is waiting through
+                            ▼
+              Capability(id, what it is good for, the exact call to make)
+```
+
+The probe is what makes everything above it honest. It reports, per metadata key, **what
+share of records actually carry it** — because *"the index has a `strategy` key"* and *"every
+record has one"* look identical if all you ask is whether you ever saw it, and a filter built
+on the first is a narrowing the effort ladder believes it applied and never got. A model
+writes the prose; only the measurement is allowed to decide what a query may contain
+([`docs/17-understanding.md`](docs/17-understanding.md)).
+
+An absent column is a **lost capability, never a substituted one**: no `tsv` means the
+keyword channel is off and rung 2 is told so before it asks, rather than a predicate quietly
+defaulted to match everything.
+
+### The agent goes and looks
+
+Everything you connected used to be described in the system prompt of *every* turn — a card
+per store, plus the OpenAI schema for every action in every linked toolkit. That grew with
+the account instead of with the question, it was a menu the model happily answered *from*
+(cards carry real numbers, and a model handed one recites it), and with two stores attached
+it could not choose between them anyway.
+
+Now the agent opens holding **one** tool and goes and looks:
+
+```
+  "check my inbox and list me all the emails"
+              │
+              ▼
+    find_capability("check my inbox")          ← the only schema in round 1
+              │
+              ▼
+    semantic search over what THIS person connected
+    (title, summary, topics, what each is good for — embedded locally)
+              │
+              ▼
+    gmail — "use the GMAIL_* tool the answer names"
+              │
+              ├──► GMAIL_FETCH_EMAILS(...)     ← unlocked by that discovery, and only gmail
+              │
+              ▼
+    the reply, streamed into Bulbul while it is still being written
+```
+
+<div align="center">
+<img src="images/tool-calling.png" alt="A spoken turn that ran two tools: the Tool calls card shows Find capability at 1.8 s and Gmail fetch emails at 3.3 s, and the Activity feed shows GMAIL_FETCH_EMAILS and a 32-word reply" width="900">
+</div>
+
+That screenshot is the whole flow, measured: **find capability 1.8 s, `GMAIL_FETCH_EMAILS`
+3.3 s, 5.2 s of tool time**, then a 32-word reply spoken in two parts. The same shape answers
+the other two kinds — the only thing that differs is what discovery names:
+
+| Asked | Discovery returns | The agent then calls |
+| --- | --- | --- |
+| *"check my inbox"* | `gmail` — a toolkit | `GMAIL_FETCH_EMAILS` |
+| *"how many students are enrolled?"* | `pgvector` — *student records* | `search_store(store="pgvector", …)` |
+| *"average marks by class"* | `marks` — a dataset | `query_dataset(dataset="marks", …)` |
+
+Four rules hold it together, and they are the reason this is not just prompt-stuffing with
+extra steps:
+
+- **Discovery returns instructions, never data.** A match is an id, what it is good for, and
+  the call to make next — never a count, never a row. The agent still has to make that call,
+  which is what stops a description being mistaken for an answer.
+- **Nothing is unlocked until it is relevant.** Round 1 offers one schema. `search_store`,
+  `query_dataset` and a toolkit's actions appear only once a discovery has named them, and
+  only the toolkit that was named. Unlocking is per turn and forward-only, so a turn cannot
+  act on something discovered while answering something else.
+- **No discovery, no gate.** If the capability index is off, or profiling is, or a store was
+  connected thirty seconds ago and its probe has not finished, the agent gets every tool the
+  way it did before any of this existed. Gating a mailbox behind a description of it and then
+  not having the description is the one outcome worse than a long prompt.
+- **Counts, not names.** What is left in the prompt is `2 connected stores, 1 dataset,
+  1 connected account.` — because a name is a hint, and a model given *"you have a students
+  dataset"* will answer a question about students without ever querying one.
+
+Routing is scored on **lift** — how far the best card sits above the mean of your own cards —
+rather than an absolute cosine floor, because e5 over short cards lives in a band too narrow
+for a fixed threshold to sit in. On a real account all fourteen probe queries
+route correctly, including the five that correctly route to nothing at all
+([`docs/23-capabilities.md`](docs/23-capabilities.md) has the numbers).
+
+### What it costs, and what it does not
+
+**Connect nothing and you pay nothing.** No schema in the prompt, no discovery round trip, no
+change to any number in [`docs/11-voice.md`](docs/11-voice.md) — the tool pass is buffered (a
+call's arguments arrive in fragments and mean nothing until the last one), so the very first
+thing it does is leave when there is nothing to offer. That is every session until somebody
+opens the panel.
+
+Connect something and a turn that needs a tool pays one extra buffered round trip; a turn that
+does not still carries a single schema instead of your whole account. Tool failures are told
+to the model rather than hidden, so it says *"I couldn't reach your mailbox"* instead of
+answering from a silence — and Composio's `200 { successful: false }` counts as a failure,
+which is the quiet bug that would otherwise report a refused send as a sent email.
+
+Every call is **written down beside the turn that caused it**: slug, toolkit, status, latency,
+the arguments the agent decided on, and the head of what came back with the true size beside
+it. A message can be re-read; an email is sent — so the thread shows what ran, and an operator
+can tell a tool failing for everybody from the model being unhelpful.
 
 | Piece | File |
 | --- | --- |
 | Connectors, attached per signed-in user | [`src/connectors/`](src/connectors/), [`docs/13-connectors.md`](docs/13-connectors.md) |
+| Measuring a connected store instead of guessing | [`src/connectors/probes/`](src/connectors/probes/), [`docs/17-understanding.md`](docs/17-understanding.md) |
+| Datasets — a URL, pulled, measured, then queried in SQL | [`src/datasets/`](src/datasets/), [`docs/18-datasets.md`](docs/18-datasets.md) |
+| Composio's two keys and its second transport | [`src/integrations/`](src/integrations/), [`docs/20-composio-gateway.md`](docs/20-composio-gateway.md) |
+| How the agent finds what it can reach | [`src/capabilities/`](src/capabilities/), [`docs/23-capabilities.md`](docs/23-capabilities.md) |
+| The one discovery tool, and what a match unlocks | [`src/tools/capabilities.py`](src/tools/capabilities.py), [`src/tools/kit.py`](src/tools/kit.py) |
 | The agent running a user's tools | [`src/agents/tool_agent.py`](src/agents/tool_agent.py), [`src/chat/tool_calls.py`](src/chat/tool_calls.py) |
 | Every agent, and the contract under them | [`src/agents/`](src/agents/), [`docs/21-agents.md`](docs/21-agents.md) |
 | What each agent is told, in markdown | [`src/prompts/`](src/prompts/) |
-| The tools an agent can run | [`src/tools/`](src/tools/) |
-| How the agent finds what it can reach | [`src/capabilities/`](src/capabilities/), [`docs/23-capabilities.md`](docs/23-capabilities.md) |
 | Where a user's vectors are searched | [`src/rag/backends/`](src/rag/backends/) |
 
 ## The effort ladder
@@ -256,6 +404,26 @@ hiding behind it. [`docs/15-effort.md`](docs/15-effort.md) is the whole ladder.
 | `GET /metrics` | live P50/P70/P95/P99/P100 per stage, with N |
 | `GET /metrics/recent` | the last few request traces — why did it refuse *that* query? |
 
+And the connector half — every one of these needs a **verified Clerk token**, because a saved
+conversation belongs to whoever holds the browser but a credential does not:
+
+| Endpoint | What it does |
+| --- | --- |
+| `GET /connectors` | every connector, and your state on each |
+| `PUT /connectors/{slug}` | connect a service, or replace its credentials — verified before anything is stored |
+| `DELETE /connectors/{slug}` | disconnect it. Composio's upstream consents stay yours |
+| `GET /connectors/capabilities` | **what the agent can reach right now** — every store this app has measured, and which one currently resolves. Never blocks on a probe |
+| `GET /connectors/{slug}/profile` | what this app measured about one connected store |
+| `POST /connectors/{slug}/profile` | read it again, now — an index changes after it is connected |
+| `GET /integrations/toolkits` | what can be linked through your Composio project |
+| `POST /integrations/connect` | start a toolkit link — returns the consent URL |
+| `GET /integrations/tools` | what your linked services let the agent actually do |
+| `DELETE /integrations/{toolkit}` | drop a toolkit's rows here; revokes nothing upstream |
+| `GET /datasets` · `POST /datasets` | your attached datasets, and attach one by URL |
+| `GET /datasets/{id}` | what was understood about it — tables, columns, what a query may do |
+| `POST /datasets/{id}/query` | ask it something in SQL, sandboxed |
+| `POST /datasets/{id}/rebuild` · `DELETE /datasets/{id}` | pull and measure it again, or detach it |
+
 Interactive docs are at `/docs` once the server is up.
 
 ## Repo layout
@@ -274,6 +442,12 @@ model-driven decisions with their prompts in [`prompts/`](src/prompts/) and what
 [`tools/`](src/tools/), [`rag/`](src/rag/) owns the pipeline stages,
 [`schemas/`](src/schemas/) own the wire models, and [`api/router.py`](src/api/router.py)
 mounts every controller.
+
+The connector half runs alongside it: [`connectors/`](src/connectors/) attaches and measures
+a service, [`integrations/`](src/integrations/) carries Composio's second consent step,
+[`datasets/`](src/datasets/) pulls and profiles a URL, and
+[`capabilities/`](src/capabilities/) turns all three into the one thing an agent can be
+handed — *something I could use, and the call that uses it*.
 
 ## Constraints worth knowing
 
@@ -301,5 +475,7 @@ first:
 | [`13-connectors.md`](docs/13-connectors.md) | what a user attaches, and why nothing is baked in |
 | [`15-effort.md`](docs/15-effort.md) | the slider as five architectures, and the answer cache under all of them |
 | [`16-memory.md`](docs/16-memory.md) | what carries between conversations, and what deliberately does not |
+| [`17-understanding.md`](docs/17-understanding.md) | measuring a connected store, and why coverage is the only number that matters |
+| [`23-capabilities.md`](docs/23-capabilities.md) | how the agent discovers what it can reach, one tool call at a time |
 | [`22-no-local-corpus.md`](docs/22-no-local-corpus.md) | why "nothing connected" is an answer rather than an error |
 | [`04-latency.md`](docs/04-latency.md) | the 200 ms budget, where it holds, and where it does not |

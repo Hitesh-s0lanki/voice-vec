@@ -19,7 +19,7 @@ import argparse
 import time
 
 from src.chat.store import CONVERSATIONS, MESSAGES, get_chat_store
-from src.chat.tools import TOOL_CALLS, get_tool_call_store
+from src.chat.tool_calls import TOOL_CALLS, get_tool_call_store
 from src.core.db import DatabaseUnavailable, get_db
 from src.connectors.profile_store import PROFILES, get_profile_store
 from src.connectors.store import ACCOUNTS, get_connector_store
@@ -73,7 +73,7 @@ def main() -> None:
 
     # What the agent ran, beside the conversation that caused it. A tool call
     # is the one thing a spoken turn does that has an effect outside this app,
-    # so it gets its own audit trail (src/chat/tools.py).
+    # so it gets its own audit trail (src/chat/tool_calls.py).
     get_tool_call_store().ensure_schema()
     print(f"schema ready: {TOOL_CALLS}")
 

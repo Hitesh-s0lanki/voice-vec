@@ -1,0 +1,232 @@
+name: Backend CI
+
+# The backend is this repository's root — frontend/ is the other half and has
+# its own pipeline — so this is an exclusion filter rather than a 'backend/**'
+# one. Documentation-only edits are excluded too.
+on:
+  push:
+    branches: [main, master, develop]
+    paths-ignore:
+      - 'frontend/**'
+      - 'docs/**'
+      - 'images/**'
+      - 'reports/**'
+      - '**.md'
+  pull_request:
+    paths-ignore:
+      - 'frontend/**'
+      - 'docs/**'
+      - 'images/**'
+      - 'reports/**'
+      - '**.md'
+  workflow_dispatch:
+
+# A new push to the same branch cancels the previous run.
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Fail instead of silently resolving a different dependency set.
+  UV_LOCKED: '1'
+  FORCE_COLOR: '1'
+  # Named here because the cache key below depends on it: change the model in
+  # src/core/config.py and this has to move with it, or CI restores the wrong
+  # weights and the smoke job downloads on top of them.
+  EMBED_MODEL: intfloat/multilingual-e5-small
+
+jobs:
+  lock:
+    name: Lockfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          cache-suffix: lock
+
+      - name: Verify uv.lock matches pyproject.toml
+        # The Dockerfile installs with --frozen, so a stale lock means the
+        # image and this run install different dependency sets.
+        run: uv lock --check
+
+      - name: Verify the pinned requirements files match the lock
+        # requirements.txt and requirements-dev.txt are generated from uv.lock
+        # for the platforms that want a plain pip install. Regenerating them
+        # here and diffing is the only thing that keeps them honest.
+        run: |
+          set -euo pipefail
+          # No --frozen: UV_LOCKED above is the env form of --locked, and uv
+          # refuses the two together.
+          uv export --no-dev --no-emit-project --no-hashes --no-header \
+            --format requirements-txt > "$RUNNER_TEMP/generated.txt"
+
+          # Compare the pins only. Both files carry `# via` annotation lines,
+          # which are indented, and the `^[A-Za-z0-9]` filter drops them the
+          # same way on every grep — an earlier `^\s*(#|$)` filter stripped them
+          # from one side and not the other on the runner, which reported a
+          # lockfile that matched as one that did not.
+          #
+          # Two plain files rather than process substitution, so a failure shows
+          # what was actually compared.
+          grep -E '^[A-Za-z0-9]' requirements.txt > "$RUNNER_TEMP/committed.pins"
+          grep -E '^[A-Za-z0-9]' "$RUNNER_TEMP/generated.txt" > "$RUNNER_TEMP/generated.pins"
+          echo "committed: $(wc -l < "$RUNNER_TEMP/committed.pins") pins"
+          echo "generated: $(wc -l < "$RUNNER_TEMP/generated.pins") pins"
+
+          if ! diff -u "$RUNNER_TEMP/committed.pins" "$RUNNER_TEMP/generated.pins"; then
+            echo '::error::requirements.txt is out of date — regenerate it from uv.lock'
+            exit 1
+          fi
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # pyproject requires >=3.13, so this is the whole supported set. Add a
+        # version here and it is tested, not just declared.
+        python-version: ['3.13']
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-suffix: test-${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      - name: Run tests
+        # No .env is checked in, so the suite runs on Settings' defaults —
+        # which is the point: it must not need a provider key to pass.
+        # `python -m`, not the `pytest` console script: the module form puts the
+        # working directory on sys.path, and this is a virtual project, so `src`
+        # is never installed into the environment. Plain `uv run pytest` collects
+        # 15 ModuleNotFoundError instead.
+        run: uv run python -m pytest -q --junitxml=junit.xml
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-junit-py${{ matrix.python-version }}
+          path: junit.xml
+          retention-days: 7
+          if-no-files-found: warn
+
+  test-postgres:
+    name: Test against PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        # pgvector, not plain postgres: src/core/db.py runs
+        # `CREATE EXTENSION IF NOT EXISTS vector` on every new connection.
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: vec
+          POSTGRES_PASSWORD: vec
+          POSTGRES_DB: vec_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vec"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://vec:vec@127.0.0.1:5432/vec_test
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          cache-suffix: postgres
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      - name: Create the schema
+        # Proves every ensure_schema builds a working schema on a real
+        # PostgreSQL, and that the pgvector extension is reachable — not just
+        # that the SQL parses.
+        run: uv run python -m scripts.migrate
+
+      - name: Create the schema again
+        # Every ensure_schema claims to be idempotent, and the container
+        # entrypoint runs them on every boot. This is that claim, tested.
+        run: uv run python -m scripts.migrate
+
+      - name: Run tests against PostgreSQL
+        # `python -m`, not the `pytest` console script: the module form puts the
+        # working directory on sys.path, and this is a virtual project, so `src`
+        # is never installed into the environment. Plain `uv run pytest` collects
+        # 15 ModuleNotFoundError instead.
+        run: uv run python -m pytest -q
+
+  smoke:
+    name: Smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lock, test]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          cache-suffix: smoke
+
+      - name: Install runtime dependencies only
+        # No dev group: proves the app boots with just what production installs.
+        run: uv sync --locked --no-dev
+
+      - name: Restore the embedding model
+        # ~670 MB from HuggingFace otherwise, on every run. The image bakes it
+        # at build time; here it is cached instead.
+        uses: actions/cache@v4
+        with:
+          path: data/models
+          key: fastembed-${{ env.EMBED_MODEL }}
+
+      - name: Boot the server and probe it
+        # The venv on PATH, so smoke.sh's plain `uvicorn` is this one.
+        # GITHUB_PATH would only take effect in the *next* step.
+        run: PATH="$PWD/.venv/bin:$PATH" bash ./scripts/smoke.sh 8123
+
+  # One stable check to require in branch protection, instead of naming every
+  # matrix job individually.
+  backend-ci:
+    name: Backend CI
+    runs-on: ubuntu-latest
+    needs: [lock, test, test-postgres, smoke]
+    if: always()
+    steps:
+      - name: Report job results
+        run: |
+          echo "lock:          ${{ needs.lock.result }}"
+          echo "test:          ${{ needs.test.result }}"
+          echo "test-postgres: ${{ needs.test-postgres.result }}"
+          echo "smoke:         ${{ needs.smoke.result }}"
+
+      - name: Fail if any job did not succeed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "::error::One or more backend CI jobs failed."
+          exit 1

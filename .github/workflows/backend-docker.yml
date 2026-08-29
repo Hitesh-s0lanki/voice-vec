@@ -1,0 +1,444 @@
+name: Backend Docker
+
+# Builds the root Dockerfile, publishes it to GHCR, boots the published image
+# against a throwaway pgvector to prove it actually starts, syncs configuration
+# to Render, and hands the digest to the deploy hook.
+#
+# Correctness of the code is backend-ci.yml's job; this workflow's job is the
+# artefact. It runs on the branches that produce a deployable image, not on
+# pull requests, so a fork cannot push to the registry.
+on:
+  push:
+    branches: [main, release]
+    paths-ignore:
+      - 'frontend/**'
+      - 'docs/**'
+      - 'images/**'
+      - 'reports/**'
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      migrate:
+        description: 'Also create the schema in the DATABASE_URL secret'
+        type: boolean
+        default: false
+
+# Deploys are not interchangeable, so a second push waits rather than
+# cancelling the first mid-flight.
+concurrency:
+  group: backend-docker-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  # metadata-action lowercases this, which ghcr requires and the owner name is not.
+  IMAGE_NAME: ${{ github.repository }}-backend
+
+jobs:
+  build:
+    name: Build and push
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      # Digest-pinned, so what gets verified and what gets deployed are the
+      # same bytes even if someone moves a tag in between.
+      pinned: ${{ steps.pin.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=prod,enable=${{ github.ref_name == 'release' }}
+          labels: |
+            org.opencontainers.image.title=Vec API
+            org.opencontainers.image.description=Voice backend that answers in the language it was asked, over whatever vector store its asker connected
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # A plain single-platform manifest. Attestations turn the push into a
+          # manifest list that several deploy targets refuse to pull by digest.
+          provenance: false
+          sbom: false
+
+      - name: Pin the digest
+        id: pin
+        run: |
+          echo "ref=${REGISTRY}/${IMAGE_NAME,,}@${{ steps.push.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+      - name: Report the image size
+        # The ONNX embedding model is baked in, so this image is large by
+        # design (see the prefetch in the Dockerfile). Printed rather than
+        # gated, so a jump that is *not* the model is visible in the log.
+        env:
+          REF: ${{ steps.pin.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # The manifest, not a pull: the compressed layer sizes are what a
+          # cold start actually transfers, and reading them costs no bandwidth.
+          bytes=$(docker buildx imagetools inspect --raw "$REF" \
+                  | jq '[.layers[].size] | add')
+          {
+            echo '### Image'
+            echo
+            echo "\`$REF\`"
+            echo
+            echo "Compressed: $(awk -v b="$bytes" 'BEGIN{printf "%.2f GB", b/1024/1024/1024}')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    name: Boot the published image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build
+    permissions:
+      contents: read
+      packages: read
+    services:
+      postgres:
+        # pgvector, because the app runs `CREATE EXTENSION IF NOT EXISTS
+        # vector` on every new connection (src/core/db.py).
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: vec
+          POSTGRES_PASSWORD: vec
+          POSTGRES_DB: vec
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vec"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compose the runtime environment
+        # The real configuration, from repository secrets and variables, minus
+        # DATABASE_URL: that is pinned to the service container below so a CI
+        # run can never write to the production database.
+        #
+        # Every value falls back to something harmless, so this workflow is
+        # green on a repository where none of the secrets exist yet and gets
+        # stricter as each one is filled in.
+        env:
+          SARVAM_API_KEY: ${{ secrets.SARVAM_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          CLERK_JWT_KEY: ${{ secrets.CLERK_JWT_KEY }}
+          CLERK_PUBLISHABLE_KEY: ${{ vars.CLERK_PUBLISHABLE_KEY }}
+          COMPOSIO_ENCRYPTION_KEY: ${{ secrets.COMPOSIO_ENCRYPTION_KEY }}
+          AGENT_MEMORY_ENDPOINT: ${{ vars.AGENT_MEMORY_ENDPOINT }}
+          AGENT_MEMORY_STORE_ID: ${{ vars.AGENT_MEMORY_STORE_ID }}
+          AGENT_MEMORY_API_KEY: ${{ secrets.AGENT_MEMORY_API_KEY }}
+          FRONTEND_URL: ${{ vars.FRONTEND_URL || 'http://localhost:3002' }}
+          # A JSON array, because Settings.cors_origins is a list[str] and
+          # pydantic-settings parses complex fields as JSON. A bare
+          # comma-separated string fails to boot.
+          CORS_ORIGINS: ${{ vars.CORS_ORIGINS || '["http://localhost:3002"]' }}
+          TTS_SPEAKER: ${{ vars.TTS_SPEAKER }}
+        run: |
+          {
+            printf 'ENVIRONMENT=production\n'
+            printf 'DATABASE_URL=postgresql://vec:vec@127.0.0.1:5432/vec\n'
+            for name in SARVAM_API_KEY OPENAI_API_KEY REDIS_URL \
+                        CLERK_JWT_KEY CLERK_PUBLISHABLE_KEY COMPOSIO_ENCRYPTION_KEY \
+                        AGENT_MEMORY_ENDPOINT AGENT_MEMORY_STORE_ID AGENT_MEMORY_API_KEY \
+                        FRONTEND_URL CORS_ORIGINS TTS_SPEAKER; do
+              # An `if`, not `[ -n … ] && printf`: a false test on the last
+              # iteration makes the whole loop exit non-zero, and the step
+              # runs under `bash -e`.
+              if [ -n "${!name}" ]; then printf '%s=%s\n' "$name" "${!name}"; fi
+            done
+          } > "$RUNNER_TEMP/api.env"
+          echo "Wrote $(wc -l < "$RUNNER_TEMP/api.env") variables (values not echoed)."
+
+      - name: Start the container
+        env:
+          IMAGE: ${{ needs.build.outputs.pinned }}
+        run: |
+          # --network host so 127.0.0.1:5432 inside the container is the
+          # service container the runner published.
+          docker run -d --name vec-api \
+            --network host \
+            --env-file "$RUNNER_TEMP/api.env" \
+            -e PORT=8000 \
+            "$IMAGE"
+
+      - name: Probe it
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:8000/health -o /tmp/health.json; then
+              break
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' vec-api)" != "true" ]; then
+              echo "::error::the container exited during startup"
+              docker logs vec-api
+              exit 1
+            fi
+            sleep 2
+          done
+
+          echo '==> GET /health'
+          curl -fsS http://127.0.0.1:8000/health -o /tmp/health.json
+          cat /tmp/health.json
+          echo
+          # `degraded` is the honest answer on a repository with no provider
+          # key yet, and it is still a 200. What must be true either way is
+          # that the baked ONNX session loaded — if it did not, this image
+          # would be downloading 670 MB on every cold start in production.
+          grep -q '"embedder_ready":true' /tmp/health.json \
+            || { echo '::error::the embedder did not load from the image'; exit 1; }
+
+          echo '==> GET /openapi.json'
+          curl -fsS -o /tmp/openapi.json -w 'HTTP %{http_code}\n' http://127.0.0.1:8000/openapi.json
+          for path in '"/ask"' '"/voice/config"'; do
+            grep -q "$path" /tmp/openapi.json \
+              || { echo "::error::$path is missing from the schema"; exit 1; }
+          done
+
+          echo '==> the schema was created inside the container'
+          # Captured rather than piped into grep. `grep -q` exits on the first
+          # match and closes the pipe, docker logs dies with SIGPIPE writing to
+          # it, and pipefail reports 141 for a pipeline whose grep succeeded —
+          # so this would assert the opposite of what it means whenever the log
+          # grew past the pipe buffer.
+          logs="$(docker logs vec-api 2>&1)"
+          case "$logs" in
+            *'schema ready'*) ;;
+            *) echo '::error::the entrypoint did not run the migrations'
+               echo "$logs"
+               exit 1 ;;
+          esac
+
+          echo '==> the process is not root'
+          test "$(docker exec vec-api id -u)" = "1001"
+
+          echo '==> the image healthcheck agrees'
+          for _ in $(seq 1 30); do
+            state="$(docker inspect -f '{{.State.Health.Status}}' vec-api)"
+            [ "$state" = starting ] || break
+            sleep 2
+          done
+          test "$state" = healthy || { echo "::error::healthcheck reports $state"; exit 1; }
+
+      - name: Container logs
+        if: always()
+        run: docker logs vec-api 2>&1 | tail -50 || true
+
+      - name: Stop the container
+        if: always()
+        run: docker rm -f vec-api || true
+
+  migrate:
+    name: Create the schema in the deployment database
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build, verify]
+    if: github.event_name == 'workflow_dispatch' && inputs.migrate
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: python -m scripts.migrate
+        # The image is the migration runner: same code, same lockfile. `migrate`
+        # is a command the entrypoint understands, so nothing here duplicates
+        # what the container already does at boot.
+        env:
+          IMAGE: ${{ needs.build.outputs.pinned }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo '::error::the DATABASE_URL secret is not set, so there is nothing to migrate'
+            exit 1
+          fi
+          docker run --rm -e DATABASE_URL "$IMAGE" migrate
+
+  configure:
+    name: Sync configuration to Render
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build, verify]
+    steps:
+      - name: Push environment variables
+        # Render reads its configuration from its own store, not from the
+        # image — nothing this pipeline builds can carry a provider key into
+        # the container. This step is the only channel there is: it writes the
+        # repository's secrets and variables to the service through Render's
+        # API, so GitHub stays the one place configuration is edited.
+        #
+        # Per-key PUT, deliberately. Render also has a bulk endpoint that
+        # replaces the service's entire environment, which would silently
+        # delete anything set in the dashboard and not mirrored here.
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ vars.RENDER_SERVICE_ID }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SARVAM_API_KEY: ${{ secrets.SARVAM_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          CLERK_JWT_KEY: ${{ secrets.CLERK_JWT_KEY }}
+          COMPOSIO_ENCRYPTION_KEY: ${{ secrets.COMPOSIO_ENCRYPTION_KEY }}
+          AGENT_MEMORY_API_KEY: ${{ secrets.AGENT_MEMORY_API_KEY }}
+          CLERK_PUBLISHABLE_KEY: ${{ vars.CLERK_PUBLISHABLE_KEY }}
+          AGENT_MEMORY_ENDPOINT: ${{ vars.AGENT_MEMORY_ENDPOINT }}
+          AGENT_MEMORY_STORE_ID: ${{ vars.AGENT_MEMORY_STORE_ID }}
+          AGENT_MEMORY_NAMESPACE: ${{ vars.AGENT_MEMORY_NAMESPACE }}
+          CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+          FRONTEND_URL: ${{ vars.FRONTEND_URL }}
+          TTS_SPEAKER: ${{ vars.TTS_SPEAKER }}
+          TTS_MODEL: ${{ vars.TTS_MODEL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$RENDER_API_KEY" ] || [ -z "$RENDER_SERVICE_ID" ]; then
+            {
+              echo '### Render configuration'
+              echo
+              echo 'Skipped. Set the `RENDER_API_KEY` secret and the'
+              echo '`RENDER_SERVICE_ID` variable to have this pipeline own the'
+              echo "service's environment. Until then it has to be edited in the"
+              echo 'Render dashboard.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo 'RENDER_API_KEY or RENDER_SERVICE_ID is absent; leaving the service configuration alone.'
+            exit 0
+          fi
+
+          # ENVIRONMENT, HOST, PORT, EMBED_CACHE_DIR and DATASET_DIR are absent
+          # on purpose. The image already pins them, and a copy in Render would
+          # be a second place for them to drift.
+          MANAGED='DATABASE_URL SARVAM_API_KEY OPENAI_API_KEY REDIS_URL
+                   CLERK_JWT_KEY CLERK_PUBLISHABLE_KEY COMPOSIO_ENCRYPTION_KEY
+                   AGENT_MEMORY_ENDPOINT AGENT_MEMORY_STORE_ID AGENT_MEMORY_API_KEY
+                   AGENT_MEMORY_NAMESPACE CORS_ORIGINS FRONTEND_URL
+                   TTS_SPEAKER TTS_MODEL'
+
+          set_count=0
+          skipped=''
+          for name in $MANAGED; do
+            value="${!name}"
+            if [ -z "$value" ]; then
+              skipped="$skipped $name"
+              continue
+            fi
+            curl -fsS -X PUT \
+              -H "Authorization: Bearer $RENDER_API_KEY" \
+              -H 'Content-Type: application/json' \
+              --data "$(jq -nc --arg v "$value" '{value: $v}')" \
+              "https://api.render.com/v1/services/${RENDER_SERVICE_ID}/env-vars/${name}" \
+              > /dev/null
+            echo "  set $name"
+            set_count=$((set_count + 1))
+          done
+
+          {
+            echo '### Render configuration'
+            echo
+            echo "Wrote **${set_count}** variables to \`${RENDER_SERVICE_ID}\`."
+            [ -n "$skipped" ] && echo "Not set (empty in GitHub):\`${skipped}\`"
+            case "${CORS_ORIGINS:-}" in
+              '') echo
+                  echo '> `CORS_ORIGINS` is unset, so the server falls back to'
+                  echo '> `["http://localhost:3002"]` and the deployed frontend'
+                  echo '> will be blocked by CORS.' ;;
+              *localhost*) echo
+                           echo '> `CORS_ORIGINS` contains localhost. The deployed'
+                           echo '> frontend is blocked until it names the real origin.' ;;
+            esac
+            case "${CORS_ORIGINS:-}" in
+              ''|'['*) ;;
+              *) echo
+                 echo '> `CORS_ORIGINS` is not a JSON array. pydantic-settings'
+                 echo '> parses it as JSON, so the server will fail to boot.' ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # configure comes first so the service already holds the right
+    # configuration when the new image starts. It never fails when the API key
+    # is absent, so this ordering costs nothing when the pipeline does not own
+    # the service's environment.
+    needs: [build, verify, configure]
+    if: github.ref_name == 'main' || github.ref_name == 'release'
+    steps:
+      - name: Trigger the deploy hook
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          IMAGE: ${{ needs.build.outputs.pinned }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo 'RENDER_DEPLOY_HOOK_URL is not set; nothing to trigger.'
+            exit 0
+          fi
+          # The hook takes the image to deploy as a query parameter, so the
+          # digest this run verified is the one that goes live.
+          ENCODED=$(python3 -c 'import os,urllib.parse;print(urllib.parse.quote(os.environ["IMAGE"], safe=""))')
+          SEP='?'
+          case "$RENDER_DEPLOY_HOOK_URL" in *\?*) SEP='&';; esac
+          curl -fsS -X POST "${RENDER_DEPLOY_HOOK_URL}${SEP}imgURL=${ENCODED}" >/dev/null
+          echo 'Deploy hook accepted.'
+
+      - name: Summary
+        env:
+          IMAGE: ${{ needs.build.outputs.pinned }}
+          HOOK_SET: ${{ secrets.RENDER_DEPLOY_HOOK_URL != '' }}
+        run: |
+          {
+            echo '### Deploy'
+            echo
+            echo "Deployable reference: \`${IMAGE}\`"
+            echo
+            if [ "$HOOK_SET" = 'true' ]; then
+              echo 'The Render deploy hook was triggered with that digest.'
+            else
+              echo 'Deploy was skipped: the `RENDER_DEPLOY_HOOK_URL` secret is not set.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
