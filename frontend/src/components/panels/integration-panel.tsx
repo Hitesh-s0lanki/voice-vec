@@ -11,9 +11,11 @@ import {
   Loader2,
   Lock,
   Plug,
+  Table2,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { AttachedDatasets } from "@/components/panels/attached-datasets";
 import { ComposioToolkits } from "@/components/panels/composio-toolkits";
 import { PanelChip, PanelHeading, PanelRule } from "@/components/panels/panel";
 import { Button } from "@/components/ui/button";
@@ -113,8 +115,13 @@ function SignedOut() {
   );
 }
 
+// One section per kind, in the order somebody scanning this reads them: what
+// it can *do*, what it can *search*, what it can *count*. A kind absent from
+// this list is a connector the server offers and this panel drops on the floor,
+// which is why `ConnectorKind` and this array are edited together.
 const GROUPS: { kind: ConnectorKind; label: string; hint: string }[] = [
   { kind: "tools", label: "Tools", hint: "Services Vec can act through" },
+  { kind: "dataset", label: "Datasets", hint: "Data Vec can query in SQL" },
   { kind: "vector", label: "Vector store", hint: "Where your embeddings live" },
 ];
 
@@ -194,10 +201,10 @@ function Connectors() {
           title={
             backend
               ? "Your questions are searched against this"
-              : "Your questions use this deployment's own index"
+              : "Connect a vector store and your questions get searched against it"
           }
         >
-          {backend ?? "default index"}
+          {backend ?? "no store connected"}
         </PanelChip>
       </Heading>
 
@@ -249,6 +256,8 @@ function Row({ connector, onOpen }: { connector: Connector; onOpen: () => void }
       <span className="glass-tile grid size-7 shrink-0 place-items-center rounded-lg text-ink-muted">
         {connector.kind === "vector" ? (
           <Database aria-hidden className="size-3.5" />
+        ) : connector.kind === "dataset" ? (
+          <Table2 aria-hidden className="size-3.5" />
         ) : (
           <Blocks aria-hidden className="size-3.5" />
         )}
@@ -376,6 +385,7 @@ function Detail({
               open a doorway to further consent screens. The vector stores are
               finished the moment they verify. */}
           {connector.slug === "composio" && <ComposioToolkits />}
+          {connector.slug === "dataset" && <AttachedDatasets />}
         </div>
       ) : (
         <CredentialForm connector={connector} onDone={onChanged} />
