@@ -1,0 +1,55 @@
+# The build context is the repository root, because the backend is the
+# repository root. Everything below is either a secret, a host artefact, the
+# other half of the repo, or dead weight in the image.
+
+# The Next.js app. Its own deploy builds it; nothing here imports it, and
+# node_modules alone would dwarf the rest of the context.
+frontend/
+
+# ~670 MB of ONNX weights and one DuckDB file per attached dataset. Both are
+# runtime state, and the model is baked by the Dockerfile's own prefetch rather
+# than copied off a developer's machine.
+data/
+
+# Configuration reaches the container through the platform's environment, never
+# through a copied file. .env in particular must never be baked in.
+.env
+.env.*
+!.env.example
+
+.venv/
+venv/
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+.coverage
+coverage.xml
+junit.xml
+htmlcov/
+
+# Local databases and their backups.
+**/*.db
+**/*.db-journal
+**/*.sqlite3
+
+tests/
+requirements-dev.txt
+
+docs/
+images/
+reports/
+*.md
+!README.md
+
+.git/
+.github/
+.gitignore
+.dockerignore
+Dockerfile
+**/.DS_Store
+.idea/
+.vscode/
