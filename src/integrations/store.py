@@ -383,13 +383,28 @@ class IntegrationStore:
 
         return _connection(row) if row else None
 
-    def reconcile(self, user_id: str, live: Iterable[tuple[str, str, str]]) -> None:
+    def reconcile(
+        self,
+        user_id: str,
+        live: Iterable[tuple[str, str, str]],
+        *,
+        sees_pending: bool = True,
+    ) -> None:
         """Bring this user's rows in line with what Composio reports.
 
         `live` is (toolkit, connected_account_id, status), straight off
         Composio's list. Toolkits it does not mention are marked REVOKED rather
         than deleted: a row that disappears takes the audit trail with it, and
         "you disconnected this" is worth being able to show.
+
+        `sees_pending` is whether the source can see a connection that has not
+        finished consent. The REST list can — an account sits there as
+        INITIALIZING while its browser tab is open — so silence about one means
+        it is gone. The MCP gateway cannot: it reports accounts, and a consent
+        in flight has none, so silence there means nothing at all. Sweeping
+        pending rows on that evidence would revoke the connection somebody is
+        in the middle of granting, between two polls of the panel that is
+        watching for it.
 
         Scoped to one user per call. A bulk reconcile across everybody would be
         cheaper per row and would also mean one buggy query could rewrite
@@ -435,7 +450,7 @@ class IntegrationStore:
                 """,
                 {
                     "user_id": user_id,
-                    "alive": [ACTIVE, *PENDING],
+                    "alive": [ACTIVE, *PENDING] if sees_pending else [ACTIVE],
                     "known": known,
                 },
             )

@@ -1,6 +1,16 @@
 "use client";
 
-import { AlertCircle, Blocks, Check, Loader2, Plug, Search, X } from "lucide-react";
+import {
+  AlertCircle,
+  Blocks,
+  Check,
+  ChevronDown,
+  Loader2,
+  Plug,
+  Search,
+  Wrench,
+  X,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { PanelChip, PanelEmpty } from "@/components/panels/panel";
@@ -11,9 +21,11 @@ import {
   disconnectToolkit,
   IntegrationError,
   listConnections,
+  listTools,
   listToolkits,
   type Connection,
   type Toolkit,
+  type ToolkitTools,
 } from "@/lib/integrations";
 import { cn } from "@/lib/utils";
 
@@ -44,6 +56,33 @@ export function ComposioToolkits() {
 
     return () => controller.abort();
   }, [reloads]);
+
+  /**
+   * What those connections actually let the agent do.
+   *
+   * A second call rather than a field on the first: it is a round trip to
+   * Composio for the tool schemas, and the linked list should paint without
+   * waiting on it. It arrives late and fills the counts in.
+   */
+  const [tools, setTools] = useState<ToolkitTools[] | null>(null);
+  const [capped, setCapped] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    void listTools(controller.signal).then((body) => {
+      if (controller.signal.aborted) return;
+      setTools(body.toolkits);
+      setCapped(body.limited);
+    });
+
+    return () => controller.abort();
+  }, [reloads]);
+
+  const byToolkit = useMemo(
+    () => new Map((tools ?? []).map((kit) => [kit.toolkit, kit])),
+    [tools],
+  );
 
   const pending = useMemo(
     () => (connections ?? []).some((connection) => connection.pending),
@@ -160,13 +199,19 @@ export function ComposioToolkits() {
         </p>
       )}
 
-      <ScrollArea className="max-h-56">
+      {/* Taller than it was: a linked service now opens onto its tool list,
+          and 17 rows behind a 224px window is a scroll bar with a keyhole in
+          front of it. The panel's own popover caps the total. */}
+      <ScrollArea className="max-h-72">
         <div className="pr-2">
           {catalogue ? (
             <Catalogue results={shown} connected={connected} busy={busy} onLink={link} />
           ) : (
             <Linked
               connections={connections}
+              tools={byToolkit}
+              loadingTools={tools === null}
+              capped={capped}
               busy={busy}
               onUnlink={unlink}
               onBrowse={() => setBrowsing(true)}
@@ -189,11 +234,17 @@ function Waiting({ children }: { children: string }) {
 
 function Linked({
   connections,
+  tools,
+  loadingTools,
+  capped,
   busy,
   onUnlink,
   onBrowse,
 }: {
   connections: Connection[] | null;
+  tools: Map<string, ToolkitTools>;
+  loadingTools: boolean;
+  capped: boolean;
   busy: string | null;
   onUnlink: (toolkit: string) => void;
   onBrowse: () => void;
@@ -214,39 +265,156 @@ function Linked({
     );
   }
 
+  const total = [...tools.values()].reduce((sum, kit) => sum + kit.count, 0);
+
   return (
-    <ul className="flex flex-col gap-0.5">
-      {connections.map((connection) => (
-        <li
-          key={connection.toolkit}
-          className="glass-row group/row flex items-center gap-3 rounded-lg px-2 py-2"
-        >
-          <Logo src={connection.logo} />
-          <div className="flex min-w-0 flex-col">
-            <p className="truncate text-[0.8rem] font-medium text-ink">
-              {connection.name ?? connection.toolkit}
-            </p>
-            <p className="truncate text-[0.7rem] text-ink-muted">
-              <Status connection={connection} />
-            </p>
-          </div>
-          <Button
-            type="button"
-            variant="ghost"
-            size="xs"
-            disabled={busy === connection.toolkit}
-            onClick={() => onUnlink(connection.toolkit)}
-            className="glass-row-danger ml-auto shrink-0 rounded-full text-ink-muted opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
-          >
-            {busy === connection.toolkit ? (
-              <Loader2 aria-hidden className="animate-spin" />
-            ) : (
-              "Unlink"
-            )}
-          </Button>
-        </li>
-      ))}
-    </ul>
+    <div className="flex flex-col gap-1">
+      <ul className="flex flex-col gap-0.5">
+        {connections.map((connection) => (
+          <li key={connection.toolkit}>
+            <LinkedService
+              connection={connection}
+              tools={tools.get(connection.toolkit) ?? null}
+              loadingTools={loadingTools}
+              busy={busy === connection.toolkit}
+              onUnlink={() => onUnlink(connection.toolkit)}
+            />
+          </li>
+        ))}
+      </ul>
+
+      {/*
+        The total, and whether it is the whole total. `tool_schema_limit` caps
+        what any one turn is handed, so a user with six services linked can be
+        told the truth — "these are the 40 it can reach for" — rather than
+        being left to wonder why the seventh never gets used.
+      */}
+      {total > 0 && (
+        <p className="px-2 pt-0.5 text-[0.66rem] text-ink-muted">
+          {total} {total === 1 ? "tool" : "tools"} available to the agent
+          {capped && " — the per-turn limit, so there may be more behind it"}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One linked service, and what it actually lets the agent do.
+ *
+ * The count is the point of this row. "Gmail · Linked" says a consent screen
+ * was completed; "Gmail · 14 tools" says what completing it bought, and
+ * opening the row names them — which is the only place in the app you can
+ * check what the model is allowed to reach for before it reaches.
+ *
+ * Read through the agent's own `tools_for`, so it is bounded the same way the
+ * turn is. A service that is linked but contributes nothing shows zero rather
+ * than nothing, because that is a real and confusing state worth naming.
+ */
+function LinkedService({
+  connection,
+  tools,
+  loadingTools,
+  busy,
+  onUnlink,
+}: {
+  connection: Connection;
+  tools: ToolkitTools | null;
+  loadingTools: boolean;
+  busy: boolean;
+  onUnlink: () => void;
+}) {
+  const count = tools?.count ?? 0;
+  const listable = connection.active && count > 0;
+
+  const summary = (
+    <>
+      <Logo src={connection.logo} />
+      <div className="flex min-w-0 flex-col">
+        <p className="truncate text-[0.8rem] font-medium text-ink">
+          {connection.name ?? connection.toolkit}
+        </p>
+        <p className="flex items-center gap-1.5 truncate text-[0.7rem] text-ink-muted">
+          <Status connection={connection} />
+          {connection.active && (
+            <>
+              <span aria-hidden>·</span>
+              <span className="tabular-nums">
+                {loadingTools && tools === null
+                  ? "counting tools…"
+                  : `${count} ${count === 1 ? "tool" : "tools"}`}
+              </span>
+            </>
+          )}
+        </p>
+      </div>
+
+      <Button
+        type="button"
+        variant="ghost"
+        size="xs"
+        disabled={busy}
+        /*
+          Inside a <summary>, so the click has to be stopped from toggling the
+          row open on its way past. `preventDefault` is what does that — the
+          disclosure is the summary's default action, not a listener.
+        */
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onUnlink();
+        }}
+        className="glass-row-danger ml-auto shrink-0 rounded-full text-ink-muted opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100"
+      >
+        {busy ? <Loader2 aria-hidden className="animate-spin" /> : "Unlink"}
+      </Button>
+    </>
+  );
+
+  // Nothing to open. A service still waiting on consent, or one whose tools
+  // could not be read, gets the same row without a disclosure rather than an
+  // arrow that opens onto an empty box.
+  if (!listable) {
+    return (
+      <div className="glass-row group/row flex items-center gap-3 rounded-lg px-2 py-2">
+        {summary}
+      </div>
+    );
+  }
+
+  return (
+    <details className="glass-row group/row group rounded-lg">
+      <summary className="flex cursor-pointer list-none items-center gap-3 rounded-lg px-2 py-2 [&::-webkit-details-marker]:hidden">
+        {summary}
+        <ChevronDown
+          aria-hidden
+          className="size-3 shrink-0 text-ink-muted transition-transform group-open:rotate-180"
+        />
+      </summary>
+
+      <ul className="flex flex-col gap-0.5 px-2 pb-2">
+        {tools?.tools.map((tool) => (
+          <li key={tool.slug} className="flex items-start gap-2 py-1">
+            <Wrench aria-hidden className="mt-1 size-3 shrink-0 text-ink-muted" />
+            <div className="min-w-0">
+              {/* The label reads, the slug identifies — and the slug is what
+                  a conversation's tool call shows, so both are here. */}
+              <p className="text-[0.74rem] leading-snug text-ink-soft">
+                {tool.name}
+                <span className="ml-1.5 font-mono text-[0.62rem] text-ink-muted">
+                  {tool.slug}
+                </span>
+              </p>
+              {tool.description && (
+                <p className="text-[0.68rem] leading-snug text-ink-muted">
+                  {tool.description}
+                </p>
+              )}
+            </div>
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }
 
@@ -298,7 +466,12 @@ function Catalogue({
                        needs an auth config in the user's own dashboard first. */
                     !toolkit.connectable
                     ? "Needs setup in your Composio dashboard"
-                    : (toolkit.description ?? `${toolkit.tools} tools`)}
+                    : /* A gateway key reaches Composio through its MCP
+                         endpoint, which names toolkits and counts nothing —
+                         so "0 tools" here would be a fact about the
+                         transport, not about the toolkit. */
+                      (toolkit.description ??
+                        (toolkit.tools > 0 ? `${toolkit.tools} tools` : "Ready to link"))}
               </p>
             </div>
             <div className="ml-auto shrink-0">

@@ -53,6 +53,35 @@ export type ToolkitList = {
   nextCursor: string | null;
 };
 
+/** One action the model can ask for. */
+export type Tool = {
+  /** Composio's own, e.g. `GMAIL_SEND_EMAIL` — what a tool call shows. */
+  slug: string;
+  /** The same thing without its toolkit prefix, in words. */
+  name: string;
+  description: string | null;
+};
+
+export type ToolkitTools = {
+  toolkit: string;
+  tools: Tool[];
+  count: number;
+};
+
+/**
+ * What the agent would be handed on the next turn.
+ *
+ * Not the catalogue's tool counts — those say what a toolkit *has*. This is
+ * read back through the same call the voice turn makes, so it is bounded by
+ * the per-turn schema limit and by which connections are actually live.
+ */
+export type ToolInventory = {
+  toolkits: ToolkitTools[];
+  total: number;
+  /** The per-turn limit was reached, so there may be more behind it. */
+  limited: boolean;
+};
+
 export type Connection = {
   toolkit: string;
   name: string | null;
@@ -134,6 +163,26 @@ export async function listToolkits(
     return (await response.json()) as ToolkitList;
   } catch {
     return { toolkits: [], nextCursor: null };
+  }
+}
+
+/**
+ * What the linked services can do, grouped by toolkit.
+ *
+ * Empty rather than thrown on failure, like the catalogue: this annotates a
+ * list that renders perfectly well without it, and a Composio that is slow to
+ * answer should not put an error over services the panel is already showing.
+ */
+export async function listTools(signal?: AbortSignal): Promise<ToolInventory> {
+  const empty: ToolInventory = { toolkits: [], total: 0, limited: false };
+
+  try {
+    const response = await fetch("/api/integrations/tools", { signal, cache: "no-store" });
+    if (!response.ok) return empty;
+
+    return (await response.json()) as ToolInventory;
+  } catch {
+    return empty;
   }
 }
 

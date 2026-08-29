@@ -34,8 +34,15 @@ from composio import Composio
 from src.connectors.service import ConnectorService, get_connector_service
 from src.connectors.store import ConnectorStore, get_connector_store
 from src.core.config import Settings, get_settings
+from src.integrations.mcp import ComposioGateway, is_gateway_key
 
 log = logging.getLogger("vec.integrations")
+
+
+#: Either transport. The SDK for a platform key, the gateway for a `ck_` one —
+#: see `ComposioClients.build`. Aliased rather than spelled out at every call
+#: site so adding a third transport is one line here.
+Client = Composio | ComposioGateway
 
 
 class ComposioUnavailable(RuntimeError):
@@ -66,7 +73,7 @@ class ComposioClients:
         # user_id → (sealed key it was built from, sdk). Bounded and LRU: a
         # client is cheap to rebuild and holding one per user who ever signed
         # in is a slow leak nobody would notice until it mattered.
-        self._cache: OrderedDict[str, tuple[str, Composio]] = OrderedDict()
+        self._cache: OrderedDict[str, tuple[str, Client]] = OrderedDict()
 
     @property
     def configured(self) -> bool:
@@ -78,14 +85,24 @@ class ComposioClients:
         """
         return self._connectors.configured
 
-    def build(self, api_key: str) -> Composio:
+    def build(self, api_key: str) -> Client:
         """A client for a key that has not been stored yet.
 
         Used to *verify* a key at connect time, before anything is written. A
-        key that cannot list a single toolkit is not worth encrypting and
-        keeping.
+        key that cannot answer is not worth encrypting and keeping.
+
+        Which client depends on the key. Composio's two products take two
+        credentials and neither works against the other's endpoint, so the
+        prefix decides the transport here — the one place it can be decided
+        without a wasted round trip and a misleading 401. Callers that care
+        which they got check with `isinstance(..., ComposioGateway)`; callers
+        that only need "this user's Composio" do not have to care.
         """
         try:
+            if is_gateway_key(api_key):
+                return ComposioGateway(
+                    api_key, timeout=float(self._settings.composio_timeout_s)
+                )
             return Composio(
                 api_key=api_key,
                 timeout=int(self._settings.composio_timeout_s),
@@ -93,7 +110,7 @@ class ComposioClients:
         except Exception as error:
             raise ComposioUnavailable(str(error)) from error
 
-    def for_user(self, user_id: str) -> Composio:
+    def for_user(self, user_id: str) -> Client:
         """This user's Composio, or an exception naming which problem it is.
 
         Raises `NotConnected` when there is no row, and also when there is one
