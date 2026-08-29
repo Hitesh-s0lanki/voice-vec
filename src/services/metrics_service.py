@@ -20,7 +20,6 @@ from typing import Any, Iterable
 
 from src.core.config import Settings, get_settings
 from src.rag.harness import STAGE_NAMES
-from src.rag.manifest import read_manifest
 from src.schemas.ask import AskResponse
 
 PERCENTILES = (50, 70, 95, 99, 100)
@@ -97,7 +96,11 @@ class MetricsService:
                 for stage in (*STAGE_NAMES, "total")
             },
             "total": _distribution(totals),
-            "index": read_manifest(),
+            # No "index" here any more. Every record already carries the
+            # `backend` that answered it, which is the honest attribution now
+            # that two requests in the same buffer can have been served by two
+            # different people's stores.
+            "by_backend": _counts(r.get("backend") or "none" for r in records),
         }
 
     def reset(self) -> None:

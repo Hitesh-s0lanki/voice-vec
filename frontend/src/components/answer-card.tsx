@@ -24,10 +24,10 @@ const HEADLINE: Record<AskResponse["status"], { label: string; icon: LucideIcon 
 /**
  * The reply, under the transcript that produced it.
  *
- * Dormant while `RAG_ENABLED` is false: the spoken loop prints no reply at
- * all — it shows the transcript in `components/transcript-card.tsx` and says
- * the answer out loud. This comes back with retrieval, where the citations
- * are the point and are worth reading — see docs/11-voice.md.
+ * Not mounted by the spoken loop, which prints no reply at all — it shows the
+ * transcript in `components/transcript-card.tsx` and says the answer out
+ * loud. This is for the read paths, where the citations are the point and are
+ * worth reading — see docs/11-voice.md.
  *
  * An abstention is rendered as a real turn rather than an error state: the
  * pipeline ran, the corpus couldn't support an answer, and saying so is the

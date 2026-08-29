@@ -1,14 +1,16 @@
-"""Apply the store schema, and prove the database is reachable before ingest.
+"""Create this app's tables, and prove the database is reachable.
 
     uv run python -m scripts.migrate
 
-Ingest calls `ensure_schema` itself, so this is not a prerequisite — it exists
-because the failures worth catching early (wrong DSN, `vector` extension not
-available, a region far enough away to blow the latency budget) are all cheap to
-find here and expensive to find thirteen minutes into an embedding run.
+There is no chunk table here and no corpus to build. This database holds what
+the app itself owns — conversations, tool calls, connected accounts and what
+was profiled about them, datasets — while retrieval reads whatever vector store
+its asker connected (docs/13-connectors.md), which this app never writes to.
 
-`--recreate` drops the table. `--indexes` builds HNSW and GIN, which ingest
-already does at the end of a run; use it only after loading rows some other way.
+Every `ensure_schema` below is idempotent and the stores call their own on
+first use, so this is not a prerequisite. It exists because the failures worth
+catching early — a wrong DSN, a region far enough away to blow the latency
+budget — are cheap to find here and expensive to find from a spoken turn.
 """
 
 from __future__ import annotations
@@ -18,30 +20,23 @@ import time
 
 from src.chat.store import CONVERSATIONS, MESSAGES, get_chat_store
 from src.chat.tools import TOOL_CALLS, get_tool_call_store
-from src.core.config import get_settings
+from src.core.db import DatabaseUnavailable, get_db
+from src.connectors.profile_store import PROFILES, get_profile_store
 from src.connectors.store import ACCOUNTS, get_connector_store
+from src.datasets.store import DATASETS, get_dataset_store
 from src.integrations.store import AUTH_CONFIGS, CONNECTIONS, get_integration_store
-from src.rag.store import StoreUnavailable, get_store
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--recreate", action="store_true", help="drop the table first")
-    parser.add_argument("--indexes", action="store_true", help="also build the indexes")
-    parser.add_argument(
-        "--english",
-        action="store_true",
-        help="embed the English original of every row missing embedding_en",
-    )
-    args = parser.parse_args()
+    parser.parse_args()
 
-    settings = get_settings()
-    store = get_store()
+    db = get_db()
 
-    print(f"connecting to {store.location}")
+    print(f"connecting to {db.location}")
     started = time.perf_counter()
     try:
-        with store.pool.connection() as conn, conn.cursor() as cur:
+        with db.pool.connection() as conn, conn.cursor() as cur:
             cur.execute("SELECT version()")
             row = cur.fetchone()
             connect_ms = (time.perf_counter() - started) * 1000
@@ -56,7 +51,7 @@ def main() -> None:
                 cur.execute("SELECT 1")
                 cur.fetchone()
                 samples.append((time.perf_counter() - tick) * 1000)
-    except StoreUnavailable as error:
+    except DatabaseUnavailable as error:
         raise SystemExit(f"cannot reach the database: {error}") from error
 
     rtt_ms = sorted(samples)[len(samples) // 2]
@@ -64,21 +59,15 @@ def main() -> None:
     print(f"  connect (once, at boot): {connect_ms:.0f} ms")
     print(f"  warm round trip: {rtt_ms:.1f} ms (median of {len(samples)})")
 
-    # Every search pays this twice — SET LOCAL, then the query. Against
+    # Every saved turn and every credential read pays this. Against
     # extraction's measured 78 ms p50 it is what decides whether the 200 ms
-    # deadline in docs/04-latency.md still holds after the move off in-process.
+    # deadline in docs/04-latency.md still holds.
     if rtt_ms > 40:
         print("  warning: too far to hold the 200 ms budget — move the database closer")
     elif rtt_ms > 15:
         print("  note: workable, but the latency headroom is thinner than in-process")
 
-    store.ensure_schema(settings.embed_dim, recreate=args.recreate)
-    print(f"schema ready: {store.table} (vector({settings.embed_dim}))")
-
-    # Conversations live in the same database and are needed whether or not
-    # retrieval is on, so they are created here too. `--recreate` does not
-    # touch them: dropping the chunk table is a re-ingest, and taking every
-    # saved conversation with it would be a surprise nobody asked for.
+    # Conversations — the saved turns, needed whether or not retrieval is on.
     get_chat_store().ensure_schema()
     print(f"schema ready: {CONVERSATIONS}, {MESSAGES}")
 
@@ -89,61 +78,32 @@ def main() -> None:
     print(f"schema ready: {TOOL_CALLS}")
 
     # Connectors — the outside services a user attaches to their account, with
-    # their credentials encrypted. Same reasoning again: needed whether or not
-    # retrieval is on, and in fact one of them *is* retrieval, since a
-    # connected vector store is what answers that user's questions
+    # their credentials encrypted. One of them *is* retrieval: a connected
+    # vector store is the only thing that answers that user's questions
     # (docs/13-connectors.md).
     get_connector_store().ensure_schema()
     print(f"schema ready: {ACCOUNTS}")
+
+    # What this app understood about each of those connected stores
+    # (docs/17-understanding.md). Ordered after the accounts because it carries
+    # a foreign key into them — `ensure_schema` does that itself, so the order
+    # here is for the printed output rather than for correctness.
+    get_profile_store().ensure_schema()
+    print(f"schema ready: {PROFILES}")
 
     # The toolkits connected through somebody's Composio. Composio-specific,
     # so it lives apart from the generic credential table above.
     get_integration_store().ensure_schema()
     print(f"schema ready: {AUTH_CONFIGS}, {CONNECTIONS}")
 
-    if args.english:
-        # The migration for an index built before the English column existed.
-        # Only the rows that need it, so it is resumable: interrupt it and the
-        # next run picks up exactly where it stopped, because "needs a vector"
-        # is a question the table answers.
-        from src.rag.embed import get_embedder
+    # Datasets a user has pointed at a URL, and what was measured of each. The
+    # profile lives here; the rows it describes live in a DuckDB file on local
+    # disk (docs/18-datasets.md). Same reasoning again: needed whether or not
+    # retrieval is on, since this answers in SQL rather than by embedding.
+    get_dataset_store().ensure_schema()
+    print(f"schema ready: {DATASETS}")
 
-        embedder = get_embedder()
-        backlog = store.english_backlog()
-        print(f"embedding {len(backlog)} English originals")
-
-        if backlog:
-            embedder.warm()
-            started = time.perf_counter()
-            batch_size = 128
-
-            for offset in range(0, len(backlog), batch_size):
-                batch = backlog[offset : offset + batch_size]
-                vectors = embedder.embed_passages(
-                    [text for _, text in batch], batch_size=len(batch)
-                )
-                store.backfill_english([key for key, _ in batch], vectors)
-
-                done = offset + len(batch)
-                rate = done / (time.perf_counter() - started)
-                print(
-                    f"  {done}/{len(backlog)}  {rate:.0f}/s  "
-                    f"eta {(len(backlog) - done) / rate / 60:.1f} min   ",
-                    end="\r",
-                    flush=True,
-                )
-            print(f"\n  done in {(time.perf_counter() - started) / 60:.1f} min")
-            # The partial HNSW index only covers non-null rows, so it has to be
-            # rebuilt over what just stopped being null.
-            args.indexes = True
-
-    if args.indexes:
-        started = time.perf_counter()
-        store.create_indexes()
-        print(f"indexes built in {time.perf_counter() - started:.1f}s")
-
-    print(f"rows: {store.count()}")
-    store.close()
+    db.close()
 
 
 if __name__ == "__main__":

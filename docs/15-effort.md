@@ -18,6 +18,25 @@ The taxonomy is the one in [agentic-rag/05-rag-architectures.md](agentic-rag/05-
 the mapping onto this system's latency budget is the one sketched in
 [agentic-rag/07-findings.md](agentic-rag/07-findings.md#what-to-port-into-vec).
 
+### What the panel shows
+
+A range, not a list: the rungs are ordered, and one notch right is strictly more work, more
+latency and more model calls than the notch left of it. Only the selected rung is named —
+five labels across a `w-72` panel need 291px of a 272px content box, and "Adaptive" was
+clipped mid-word the last time they were all laid out — so the panel carries the rung on a
+tile of its own (label, cost, one-line description, the full sentence on `title`), the
+ladder position as a `2/5` chip in the heading, and `Lookup`/`Adaptive` under the ends so
+the direction reads without dragging.
+
+Under it sits the one line that matters most, because it flips exactly at `OFFLINE_MAX_LEVEL`:
+
+```
+rungs 0–1   No model call — the 200 ms budget holds.
+rungs 2–4   A model writes it, so latency is seconds.
+```
+
+That boundary is rule 2 below, said in the place where the choice is actually made.
+
 ## Three rules the whole design rests on
 
 ### 1. The level is a ceiling, not a floor
@@ -284,7 +303,7 @@ WebSocket — and `EFFORT_MAX` caps what a deployment will run regardless of wha
 
 ```
 EFFORT_MAX=4                              # what this deployment will run
-EFFORT_DEFAULT=1
+EFFORT_DEFAULT=2                          # Deep — the first rung that writes
 EFFORT_DEADLINE_MS=[200,200,2500,9000,16000]
 
 REDIS_URL=                                # unset → no cache, full pipeline every time
@@ -309,5 +328,5 @@ Stated plainly, because the rest of these docs report numbers and this one does 
 - **`GENERATION_SUPPORT_FLOOR=0.62` likewise.** It should be swept against gold answers, where a
   hallucination rate is measurable rather than asserted.
 - **No rung above 1 has a recall or coverage number yet.** The rule that should govern this:
-  *a rung that does not beat the rung below on quality does not ship.* `scripts/evaluate.py`
+  *a rung that does not beat the rung below on quality does not ship.* The offline sweep
   aggregates by `mode` now, which is what makes that rule checkable rather than aspirational.

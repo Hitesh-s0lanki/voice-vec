@@ -13,7 +13,13 @@ over, and the second reason is the interesting one.
 
 ## It was hiding an empty table
 
-The gate reads `languages` out of `data/index-manifest.json`. That manifest said
+> **Since superseded.** There is no deployment index and no manifest any more — retrieval
+> reads whatever vector store its asker connected ([13-connectors.md](13-connectors.md)), so
+> `gate_input` is called with an empty language list and the mismatch branch fires only on a
+> language code that does not resolve at all. The finding below is why the gate stopped
+> refusing on a language label, and that part still holds.
+
+The gate read `languages` out of `data/index-manifest.json`. That manifest said
 `"collection": "vec-chunks"` and was written on 19 August against the **embedded Qdrant
 store**, one day before the store moved to Postgres. Nothing had ever been ingested into
 Neon: `SELECT count(*) FROM chunks` returned **0**.

@@ -188,7 +188,7 @@ of someone holding a microphone.
 | --- | --- |
 | `GET /conversations` | yours, newest first, empty ones hidden |
 | `POST /conversations` | open one up front — the socket does this itself on the first take |
-| `GET /conversations/{id}` | the conversation and its messages |
+| `GET /conversations/{id}` | the conversation, its messages, and what the agent ran |
 | `PATCH /conversations/{id}` | rename |
 | `DELETE /conversations/{id}` | it and its messages, by cascade |
 | `POST /conversations/adopt` | claim this browser's conversations for the signed-in account |
@@ -204,6 +204,32 @@ real navigation, because a different conversation needs a different socket.
 is what makes the answer never being printed on the stage tenable: it was *heard*, and this
 is where it can be re-read tomorrow, on another device.
 
+## What the agent ran, under the turn that ran it
+
+A message can be re-read; an email is *sent*. So tool calls are stored beside the thread
+rather than left to be inferred from a reply that mentions them, and the panel shows them
+between a question and its answer — which is when they happened.
+
+They reach the panel from two directions and have to arrive as one list:
+
+- **Fetched.** `GET /conversations/{id}` returns them as their own flat list, paired to a
+  turn by `turnId` — the same key that pairs a question to its answer. A call whose turn is
+  not on screen is dropped rather than orphaned: unlike a stray message it says nothing on
+  its own, and its turn may simply be past the message limit.
+- **Heard.** The socket announces each finished call as a `tool` frame while the turn is
+  still being spoken (see [11 — Voice](11-voice.md)). Those arrive *before* the turn does —
+  tools run in the middle of an exchange and the exchange is recorded when the reply lands —
+  so the provider holds them, keyed by turn id, and the turn collects them on the way past.
+
+The two agree because the id is minted before the row is written and sent on the wire, so
+the same call cannot appear twice. Without that, the thread showed nothing for a live turn
+and the calls only appeared on the next load of `/c/{id}`.
+
+The result travels as a bounded preview, never the payload, with `resultBytes` as the size
+of the whole — the pair reads as "here is what came back, and here is how much of it you
+are seeing". The ceiling is the containment: a result can be an entire inbox page and
+belongs to the provider, not here.
+
 ## What is not here yet
 
 - **Organisations.** Clerk has them; a conversation belongs to a person. A third column and
@@ -211,3 +237,4 @@ is where it can be re-read tomorrow, on another device.
 - **Anything to stop one account filling the table.** No quota, no retention window.
 - **Streaming a turn into the panel as it is spoken.** The optimistic copy appends on
   `turn.end`, so the thread on screen is one turn behind the database for about a second.
+  Its tool calls are already there, waiting for it.

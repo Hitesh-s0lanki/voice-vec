@@ -31,15 +31,16 @@ import uuid
 
 import numpy as np
 
+from src.agents.rag import RagAgents, Verdict
 from src.core.config import Settings, get_settings
-from src.rag import agents, effort, fuse, guardrails
+from src.rag import effort, fuse, guardrails
 from src.rag.backends.base import Capabilities, VectorBackend
+from src.connectors.profile_service import ProfileService, get_profile_service
 from src.rag.backends.resolve import BackendResolver, get_resolver
 from src.rag.cache import AnswerCache, Scope, get_cache
 from src.rag.embed import Embedder, get_embedder
 from src.rag.extract import Extraction, extract_span
 from src.rag.harness import Abstain, Ctx, Harness, Refuse
-from src.rag.manifest import indexed_languages, read_manifest
 from src.rag.rerank import rerank
 from src.rag.store import Hit, StoreUnavailable
 from src.schemas.ask import AskRequest, AskResponse, Citation, Timings
@@ -56,16 +57,33 @@ class AskService:
         resolver: BackendResolver,
         metrics: MetricsService,
         cache: AnswerCache,
+        profiles: ProfileService | None = None,
     ) -> None:
         self._settings = settings
         self._embedder = embedder
         self._resolver = resolver
         self._metrics = metrics
         self._cache = cache
+        # What was measured about the store answering this question, which is
+        # where the router's description of the corpus comes from now that
+        # there is no deployment corpus to describe (docs/17-understanding.md).
+        # Optional so a service built without one still routes, on the
+        # backend's own one-line `describe()`.
+        self._profiles = profiles
+        # The optional stages, built once. They hold the same settings this
+        # service does, so a call site names the stage and its arguments and
+        # nothing else — which is what makes the ladder readable as a ladder.
+        self._agents = RagAgents(settings)
 
     # ---- the pipeline ----------------------------------------------------
 
-    def ask(self, request: AskRequest, *, user_id: str | None = None) -> AskResponse:
+    def ask(
+        self,
+        request: AskRequest,
+        *,
+        user_id: str | None = None,
+        store: str | None = None,
+    ) -> AskResponse:
         settings = self._settings
         level = settings.effort_level(request.effort)
         ctx = Ctx(
@@ -81,23 +99,18 @@ class AskService:
         run = _Run(
             request=request, level=level, ctx=ctx, harness=harness, settings=settings
         )
-
-        if not settings.rag_enabled:
-            # Retrieval is switched off for the voice build. Abstaining is both
-            # honest and already part of the contract — better than searching an
-            # index that was never warmed and reporting whatever comes back.
-            return self._respond(
-                run,
-                status="abstained",
-                answer=None,
-                citations=[],
-                confidence=0.0,
-                reason="Retrieval is switched off — set RAG_ENABLED=true to search the corpus.",
-                tier=0,
-            )
+        # Named by capability discovery when several stores are attached, and
+        # a preference rather than an assertion — see `BackendResolver.for_user`.
+        run.prefer = store
 
         try:
             self._gate_input(run)
+            # Before embedding, not after: a connected index built by another
+            # model needs its *own* embedder, and only the resolved backend
+            # knows which that is. Resolving here rather than inside
+            # `_from_cache` also makes the ordering explicit instead of a side
+            # effect of the cache lookup.
+            self._resolve_backend(run, user_id)
             self._embed(run)
 
             cached = self._from_cache(run, user_id)
@@ -105,7 +118,7 @@ class AskService:
                 return cached
 
             if effort.uses_routing(level):
-                self._route(run)
+                self._route(run, user_id)
 
             self._resolve_backend(run, user_id)
             self._retrieve(run)
@@ -164,7 +177,13 @@ class AskService:
                 run.request.transcript,
                 run.request.language_code,
                 self._settings,
-                indexed_languages(),
+                # Empty, and not an oversight. The languages a corpus held used
+                # to be read off this deployment's ingest manifest; a connected
+                # store is somebody else's and does not declare them. So the
+                # gate stops claiming to know, and the cross-lingual question
+                # is settled where it is actually measurable — Gate 2, on the
+                # score (`_score_retrieval`).
+                [],
             ),
         )
         assert verdict is not None
@@ -176,21 +195,34 @@ class AskService:
         if verdict.status == "abstained":
             raise Abstain(verdict.reason or "I don't have that in my sources.")
 
-        # Asked in a language the index does not hold. Gate 1 routes rather
+        # Asked in a language whose code did not resolve. Gate 1 routes rather
         # than refuses (see the language block there): search unfiltered, score
         # against a floor set for cross-lingual cosines, and answer from the
-        # original English each chunk carries.
+        # English original whenever a chunk carries one.
         run.english = verdict.cross_lingual
 
     def _embed(self, run: _Run) -> None:
-        vector = run.harness.stage(
-            "embed",
-            lambda: self._embedder.embed_query(run.query),
-        )
+        """Embed with whatever model can search the store that will answer.
+
+        Through the backend rather than through `self._embedder` directly. A
+        connected store built at this app's own width returns the local
+        embedder, so this costs one call — and for a store built at another
+        width it is the difference between a search and a dimension error on
+        every question.
+        """
+        # `getattr` rather than a direct call: `VectorBackend` is a structural
+        # Protocol, so a backend written before this method existed — a test
+        # double, an out-of-tree implementation — is still a valid backend. It
+        # gets the local embedder, which is the answer it had before.
+        embed = getattr(run.store, "embed_query", None) if run.store else None
+        if embed is None:
+            embed = self._embedder.embed_query
+
+        vector = run.harness.stage("embed", lambda: embed(run.query))
         assert vector is not None
         run.query_vector = vector
 
-    def _route(self, run: _Run) -> None:
+    def _route(self, run: _Run, user_id: str | None) -> None:
         """Adaptive RAG's pre-retrieval router.
 
         The one stage that can save the *entire* pipeline rather than improve
@@ -204,10 +236,9 @@ class AskService:
         """
         decision = run.harness.stage(
             "route",
-            lambda: agents.route(
+            lambda: self._agents.router.route(
                 query=run.query,
-                settings=self._settings,
-                corpus=self._corpus_hint(),
+                corpus=self._corpus_hint(run, user_id),
             ),
             optional=True,
         )
@@ -226,41 +257,51 @@ class AskService:
             raise Abstain("That isn't something my sources cover.")
 
     def _resolve_backend(self, run: _Run, user_id: str | None) -> None:
-        """Whose vectors these are.
+        """Whose vectors these are — and whether there are any.
 
         A user who connected Pinecone, Astra or their own Postgres is searched
-        against that; everybody else gets the deployment's store
-        (docs/13-connectors.md). Resolved per call rather than held on the
-        service, because the service is a singleton and the answer differs per
-        caller.
+        against that, and nobody else is searched at all: this deployment holds
+        no corpus of its own (docs/13-connectors.md). Resolved per call rather
+        than held on the service, because the service is a singleton and the
+        answer differs per caller.
+
+        No backend is an abstention and not an error. "Nothing is connected"
+        is a true, actionable answer — the connectors panel is one tap away —
+        whereas a 500 from here would read as the app being broken.
         """
         if run.store is not None:
             return  # the cache stage already resolved it; the answer is per-user
 
-        store = self._resolver.for_user(user_id)
-        run.store = store
+        resolved = self._resolver.for_user(user_id, prefer=run.prefer)
+        if resolved is None:
+            run.escalate("no-backend")
+            raise Abstain(
+                "I don't have a source to search yet — connect a vector store "
+                "and I can answer from it."
+            )
+        run.store = resolved
         try:
-            run.caps = store.capabilities()
+            run.caps = resolved.capabilities()
         except Exception:
             # A backend that cannot describe itself is treated as the least
             # capable one, which is the same thing every rung already handles.
             run.caps = Capabilities()
-        run.backend = _describe(store)
+        run.backend = _describe(resolved)
 
     def _retrieve(self, run: _Run) -> None:
         settings = self._settings
         store = run.store
         assert store is not None and run.query_vector is not None
 
-        # Filter by language only when the index actually holds more than one.
-        # Filtering on the sole indexed value cannot change the result set, and
-        # on a filtered ANN search it can actively hurt: pgvector discards
-        # non-matching rows *while* walking the HNSW graph, so a predicate that
-        # excludes nothing still costs candidates. A cross-lingual question
-        # filters by nothing: the whole point is that the passage it wants is
-        # in another language.
-        languages = indexed_languages()
-        language = run.verdict.language if len(languages) > 1 and not run.english else None
+        # Never filtered by language. This used to filter whenever the ingest
+        # manifest showed more than one language in the index; a connected
+        # store has no manifest and this app has no business guessing at the
+        # language tags in somebody else's metadata. Guessing wrong is not a
+        # neutral cost either — on a filtered ANN search pgvector discards
+        # non-matching rows *while* walking the HNSW graph, so a predicate on a
+        # field the store does not carry the way we assume returns fewer
+        # candidates rather than none, which reads as poor recall.
+        language = None
 
         def search() -> list[Hit]:
             dense = store.search(
@@ -395,7 +436,7 @@ class AskService:
         """
         rewritten = run.harness.stage(
             "rewrite",
-            lambda: agents.rewrite_query(query=run.query, settings=self._settings),
+            lambda: self._agents.rewriter.rewrite(query=run.query),
             optional=True,
         )
         if not rewritten:
@@ -449,10 +490,9 @@ class AskService:
         """
         grade = run.harness.stage(
             "grade",
-            lambda: agents.grade_relevance(
+            lambda: self._agents.relevance.grade(
                 query=run.query,
                 hits=run.hits,
-                settings=self._settings,
                 english=run.english,
             ),
             optional=True,
@@ -572,10 +612,9 @@ class AskService:
         for attempt in range(2):
             answer = run.harness.stage(
                 "generate",
-                lambda: agents.synthesise(
+                lambda: self._agents.synthesis.write(
                     query=run.query,
                     hits=run.hits,
-                    settings=self._settings,
                     english=run.english,
                 ),
             )
@@ -644,7 +683,7 @@ class AskService:
 
         return self._fallback_extractive(run)
 
-    def _grade_answer(self, run: _Run, answer: str) -> agents.Verdict | None:
+    def _grade_answer(self, run: _Run, answer: str) -> Verdict | None:
         """The usefulness half of Gate 4, and only where it can be acted on.
 
         Rungs 2 and 3 have no repair for "grounded but off-target" — rung 3
@@ -655,11 +694,10 @@ class AskService:
             return None
         return run.harness.stage(
             "grade",
-            lambda: agents.grade_answer(
+            lambda: self._agents.verdict.grade(
                 query=run.query,
                 answer=answer,
                 hits=run.hits,
-                settings=self._settings,
                 english=run.english,
             ),
             optional=True,
@@ -681,7 +719,7 @@ class AskService:
     def _scope(self, run: _Run, user_id: str | None) -> Scope:
         return Scope(
             user=user_id or "anonymous",
-            backend=run.backend or "default",
+            backend=run.backend or "none",
             mode=effort.name(run.level),
             language=run.ctx.language or "unknown",
             english=run.english,
@@ -690,14 +728,14 @@ class AskService:
     def _from_cache(self, run: _Run, user_id: str | None) -> AskResponse | None:
         """Rung 1 and up. Rung 0 is already cheaper than a cache round trip.
 
-        The backend has not been resolved yet at this point, and it is part of
-        the scope, so it is resolved here — the same call the pipeline would
-        make a moment later, and cached per user by the resolver either way.
+        The backend is already resolved — `ask` does it before embedding, since
+        a connected index built by another model needs its own embedder — and
+        it is part of the scope, so this only reads it.
         """
         if run.level < effort.GROUNDED or not self._cache.configured:
             return None
 
-        self._resolve_backend(run, user_id)
+        self._resolve_backend(run, user_id)  # idempotent; a no-op once resolved
         scope = self._scope(run, user_id)
 
         hit = run.harness.stage(
@@ -759,24 +797,30 @@ class AskService:
 
     # ---- helpers ---------------------------------------------------------
 
-    def _corpus_hint(self) -> str:
-        """One line about what is actually indexed, for the router to route on.
+    def _corpus_hint(self, run: _Run, user_id: str | None) -> str:
+        """One line about what the connected store holds, for the router.
 
-        Built from the ingest manifest rather than hardcoded, because a vague
-        description is a routing bug: told only "a passage index", the router
-        decides a perfectly ordinary factual question is something a search
-        could not help with and skips retrieval entirely. The chunk count and
-        the languages are what make "would this be in there?" answerable.
+        A vague description is a routing bug: told only "a vector index", the
+        router decides a perfectly ordinary factual question is something a
+        search could not help with and skips retrieval entirely. So this wants
+        to be specific, and it can be — the profile already sampled this store
+        and wrote a paragraph about what is in it (docs/17-understanding.md).
+
+        Falls back to the backend's own one-line `describe()`, and past that to
+        a generic line. Never raises and never blocks: a store connected
+        seconds ago has no profile yet, and the right answer for that request
+        is a weaker hint rather than a stall while somebody's index is sampled.
         """
-        manifest = read_manifest() or {}
-        languages = ", ".join(manifest.get("languages") or indexed_languages()) or "unknown"
-        chunks = manifest.get("chunks")
-        size = f"{chunks:,} passages" if isinstance(chunks, int) else "a passage index"
-        return (
-            f"{size} of general-knowledge web text — encyclopedic and how-to "
-            f"articles covering facts, definitions, places, organisations, "
-            f"health, science and everyday questions. Languages: {languages}."
-        )
+        card = ""
+        if self._profiles is not None and run.store is not None:
+            try:
+                card = self._profiles.card(user_id, run.store.name)
+            except Exception as error:
+                run.ctx.trace.append({"corpus": f"{type(error).__name__}: {error}"})
+
+        if card:
+            return card
+        return run.backend or "a connected vector index of unknown content"
 
     def _confidence(self, run: _Run, span_score: float) -> float:
         floor = (
@@ -865,7 +909,7 @@ class _Run:
     __slots__ = (
         "request", "level", "ctx", "harness", "settings", "store", "caps", "verdict",
         "query_vector", "english", "hits", "dense", "confidence", "escalations",
-        "backend", "rewritten", "direct", "_repairs",
+        "backend", "rewritten", "direct", "prefer", "_repairs",
     )
 
     def __init__(
@@ -896,6 +940,9 @@ class _Run:
         self.backend: str | None = None
         self.rewritten: str | None = None
         self.direct = False
+        #: Which connector this question was routed to, when discovery named
+        #: one. `None` is "whichever this user has", the standing order.
+        self.prefer: str | None = None
         self._repairs = 0
 
     @property
@@ -952,4 +999,5 @@ def get_ask_service() -> AskService:
         get_resolver(),
         get_metrics_service(),
         get_cache(),
+        get_profile_service(),
     )

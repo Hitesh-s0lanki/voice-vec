@@ -95,30 +95,3 @@ export async function askVec(
 
   return body;
 }
-
-export type Suggestion = {
-  query: string;
-  queryType: string;
-  confidence: number;
-};
-
-/**
- * Questions this index demonstrably answers, verified by
- * `scripts/suggestions.py` rather than assumed.
- *
- * The corpus is ~2,000 specific MS MARCO questions, so an unprompted question
- * is far more likely to miss than hit — and a correct abstention reads as a
- * broken system when you have no way to know what is in there. Never throws:
- * no suggestions just means the row stays hidden.
- */
-export async function fetchSuggestions(
-  limit = 4,
-): Promise<{ suggestions: Suggestion[]; corpus: string | null }> {
-  try {
-    const response = await fetch(`/api/suggestions?limit=${limit}`);
-    if (!response.ok) return { suggestions: [], corpus: null };
-    return await response.json();
-  } catch {
-    return { suggestions: [], corpus: null };
-  }
-}
