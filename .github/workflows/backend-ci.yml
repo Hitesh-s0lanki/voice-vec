@@ -63,7 +63,9 @@ jobs:
         # here and diffing is the only thing that keeps them honest.
         run: |
           set -euo pipefail
-          uv export --frozen --no-dev --no-emit-project --no-hashes --no-header \
+          # No --frozen: UV_LOCKED above is the env form of --locked, and uv
+          # refuses the two together.
+          uv export --no-dev --no-emit-project --no-hashes --no-header \
             --format requirements-txt > /tmp/requirements.check
           if ! diff -u <(grep -vE '^\s*(#|$)' requirements.txt) \
                       <(grep -vE '^\s*(#|$)' /tmp/requirements.check); then
@@ -97,7 +99,11 @@ jobs:
       - name: Run tests
         # No .env is checked in, so the suite runs on Settings' defaults —
         # which is the point: it must not need a provider key to pass.
-        run: uv run pytest -q --junitxml=junit.xml
+        # `python -m`, not the `pytest` console script: the module form puts the
+        # working directory on sys.path, and this is a virtual project, so `src`
+        # is never installed into the environment. Plain `uv run pytest` collects
+        # 15 ModuleNotFoundError instead.
+        run: uv run python -m pytest -q --junitxml=junit.xml
 
       - name: Upload test report
         if: always()
@@ -154,7 +160,11 @@ jobs:
         run: uv run python -m scripts.migrate
 
       - name: Run tests against PostgreSQL
-        run: uv run pytest -q
+        # `python -m`, not the `pytest` console script: the module form puts the
+        # working directory on sys.path, and this is a virtual project, so `src`
+        # is never installed into the environment. Plain `uv run pytest` collects
+        # 15 ModuleNotFoundError instead.
+        run: uv run python -m pytest -q
 
   smoke:
     name: Smoke test
