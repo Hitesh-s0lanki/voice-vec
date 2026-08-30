@@ -30,8 +30,8 @@ while it is still being written — and talking over it stops it mid-word.
 > listener who has attached nothing is answered by the model and the tools they *did*
 > connect. There is no switch to turn it on ([`docs/13-connectors.md`](docs/13-connectors.md)).
 > It answers questions asked in *any* language, whatever the store was indexed in: the
-> embedder is cross-lingual, and where a store is wider than 384 dimensions the query is
-> embedded at that store's own width.
+> embedder is multilingual, and a question is embedded at whatever width that store's own
+> catalogue reports.
 > [`docs/13a-cross-lingual.md`](docs/13a-cross-lingual.md) measures what that costs.
 
 Connecting is what turns that into leverage. A vector store makes your own passages
@@ -76,9 +76,12 @@ Without uv, the same set installs from pip: `pip install -r requirements.txt`
 stays the source of truth, so bump a version in `pyproject.toml`, `uv lock`, then re-export;
 the header of each file carries the exact command.
 
-Boot loads the ONNX embedding session before it accepts traffic, which is a few seconds and
-the reason the first question is not the one that pays for it. Add `OPENAI_API_KEY` to have
-OpenAI write the replies and cover the languages Bulbul does not speak.
+Boot is close to instant — there is no model to load. Embedding is a call to
+`text-embedding-3` ([`docs/25-no-local-embedder.md`](docs/25-no-local-embedder.md)), so
+**`OPENAI_API_KEY` is what decides whether anything can be searched, reranked or grounded**.
+Without it the app still runs and still talks; it just cannot look anything up, and `/health`
+says `degraded` rather than pretending otherwise. The same key has OpenAI write the replies
+and cover the languages Bulbul does not speak.
 
 There is no index to build. This app holds no corpus of its own: a question is answered from
 the vector store its asker connected, and a user with nothing attached is told so rather
@@ -325,10 +328,11 @@ extra steps:
   dataset"* will answer a question about students without ever querying one.
 
 Routing is scored on **lift** — how far the best card sits above the mean of your own cards —
-rather than an absolute cosine floor, because e5 over short cards lives in a band too narrow
-for a fixed threshold to sit in. On a real account all fourteen probe queries
-route correctly, including the five that correctly route to nothing at all
-([`docs/23-capabilities.md`](docs/23-capabilities.md) has the numbers).
+rather than an absolute cosine floor, because where that band sits moves with the cards. All
+fourteen probe queries route correctly, including the five that correctly route to nothing at
+all ([`docs/23-capabilities.md`](docs/23-capabilities.md) has the method;
+[`25-no-local-embedder.md`](docs/25-no-local-embedder.md) has the numbers the threshold was
+re-measured at when the embedder changed).
 
 ### What it costs, and what it does not
 

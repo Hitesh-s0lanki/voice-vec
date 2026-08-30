@@ -21,24 +21,25 @@ wheel of `src/`. That is why the dependency layer needs only `pyproject.toml`
 and `uv.lock` bind-mounted, and why imports work off `PYTHONPATH=/app` rather
 than an installed distribution.
 
-### The model is baked in
+### Nothing is baked in
 
-`src/main.py`'s lifespan warms the ONNX embedder *before* the server accepts
-traffic, so P100 measures the pipeline rather than our startup. On a container
-that has never run, "warm" means fetching ~670 MB from HuggingFace first — on
-every cold start, every restart, every scale-out, and inside the platform's
-health-check window.
+This image used to carry ~670 MB of ONNX weights, because the lifespan loaded an
+embedding model before accepting traffic and a cold container would otherwise
+have fetched them from HuggingFace inside the platform's health-check window.
 
-So the Dockerfile fetches it once at build time into `/app/data/models` and the
-forward pass doubles as proof the session loads on this image. It costs ~76 s of
-build and ~1.1 GB of image; it buys a boot that reaches "application startup
-complete" in about seven seconds with no network at all. `--build-arg
-PREFETCH_EMBED_MODEL=0` opts out for a fast local image.
+That model is gone ([25-no-local-embedder.md](25-no-local-embedder.md)) — it held
+~700 MiB resident, which a 512 MiB instance cannot pay — and embedding is a call
+to `text-embedding-3` now. What is left in the image is the virtualenv and the
+source:
 
-The prefetch runs `src/rag/embed.py` rather than a hand-written copy of the
-fastembed registration, so the model, its dimension and its `model_file` cannot
-drift from `src/core/config.py`. The cost is that editing anything under `src/`
-invalidates the layer and re-runs the fetch.
+| | Before | After |
+| --- | --- | --- |
+| Image | ~1.5 GB | **120 MB** |
+| Resident at startup | 922 MiB | **184 MiB** |
+| Boot to first response | ~7 s | **1.6 s** |
+
+Verified under `--memory=512m --memory-swap=512m`: 182 MiB used, healthcheck
+healthy.
 
 ### The entrypoint
 
@@ -54,9 +55,10 @@ A `DATABASE_URL` that is set and unreachable is fatal. An *unset* one is not:
 the app degrades to "this build does not remember anything", which is a
 supported deployment, and the log says so.
 
-`WEB_CONCURRENCY` stays at 1 by default. Every worker opens its own ONNX
-session and its own keepalive loop, so a second worker costs the model's memory
-again for a server whose bottleneck is upstream providers.
+`WEB_CONCURRENCY` stays at 1 by default: this server waits on upstream
+providers rather than burning local CPU, so a second worker mostly buys another
+copy of the process. It is now safe to raise on a box with the memory for it —
+the ~700 MiB ONNX session each worker used to load is gone.
 
 `/app/data/datasets` holds one DuckDB file per attached dataset
 ([18-datasets.md](18-datasets.md)). It is ephemeral unless the platform mounts a
@@ -91,7 +93,8 @@ cannot push to the registry.
 
 `build` publishes to GHCR and pins the digest. `verify` boots *that digest*
 against a throwaway pgvector and asserts: `/health` is 200 with
-`embedder_ready:true` (proving the baked model loaded rather than downloading),
+it answered as this service (and `embedder_ready:true` when an
+`OPENAI_API_KEY` was supplied, which is a promise only then),
 `/ask` and `/voice/config` are in the schema, the entrypoint printed
 `schema ready`, the process is uid 1001, and the image's own healthcheck agrees.
 `configure` mirrors GitHub secrets and variables into the Render service one key
