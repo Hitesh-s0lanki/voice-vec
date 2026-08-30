@@ -1,60 +1,54 @@
-"""Local ONNX embedding. No network call sits on the answer path.
+"""Embedding, through OpenAI. One door, one cache, one width.
 
-`intfloat/multilingual-e5-small` — 384 dims, ~118M params, genuinely
-multilingual including Devanagari. fastembed does not ship it as a built-in, so
-it is registered as a custom model pointing at the ONNX export in the same HF
-repo (docs/02-architecture.md).
+There was a local ONNX model here — `intfloat/multilingual-e5-small`, 384
+dimensions, ~4 ms a query and no network call at all. It is gone, and
+docs/25-no-local-embedder.md is why: the session held ~700 MiB resident, which
+is not a trade a 512 MiB deployment can make. What replaces it is
+`text-embedding-3` over `src/rag/remote_embed.py`.
 
-e5 has one rule that fails silently when broken: queries are prefixed
-`query: `, passages `passage: `. Both prefixes are applied here and nowhere
-else, so no caller can forget one.
+Everything that embeds goes through this object, so there is exactly one place
+that holds the client, the width and the cache:
+
+    embed_query(text)              the app's own width — the question, a need
+    embed_query(text, dim=768)     a connected store's width, for its backend
+    embed_passages(texts)          one call for the whole batch
+
+**Two properties the callers already depend on**, both now this module's job to
+keep rather than fastembed's. Vectors come back **L2-normalised**, because
+every caller takes a dot product and calls it a cosine. And a batch comes back
+**in the order it was given**, which `remote_embed` asserts rather than trusts.
+
+**The e5 prefixes are gone with the model that needed them.** `query: ` and
+`passage: ` were an e5 rule; prepending them to a `text-embedding-3` input is
+not a no-op, it is six characters of unrelated content in every vector.
+
+**What used to be free is now a round trip**, and that is the whole character
+of this change. `count_tokens` went with the tokeniser: it had no callers left
+once the ingest pipeline was removed, and the alternative — a network call to
+count tokens — would have been absurd.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
-import time
+from collections import OrderedDict
 from functools import lru_cache
 
 import numpy as np
-from fastembed import TextEmbedding
-from fastembed.common.model_description import ModelSource, PoolingType
 
 from src.core.config import Settings, get_settings
+from src.rag.remote_embed import MAX_DIM, RemoteEmbedUnavailable, embed_texts, model_for
 
-QUERY_PREFIX = "query: "
-PASSAGE_PREFIX = "passage: "
-
-_registered: set[str] = set()
-_registry_lock = threading.Lock()
-
-
-def _register(settings: Settings) -> None:
-    """Teach fastembed about the e5 ONNX export. Idempotent."""
-    with _registry_lock:
-        if settings.embed_model in _registered:
-            return
-
-        known = {m["model"] for m in TextEmbedding.list_supported_models()}
-        if settings.embed_model not in known:
-            TextEmbedding.add_custom_model(
-                model=settings.embed_model,
-                pooling=PoolingType.MEAN,
-                normalization=True,
-                sources=ModelSource(hf=settings.embed_model),
-                dim=settings.embed_dim,
-                model_file=settings.embed_model_file,
-            )
-
-        _registered.add(settings.embed_model)
+log = logging.getLogger("vec.rag.embed")
 
 
 class Embedder:
-    """Wraps one ONNX session. Load once at boot, never per request."""
+    """`text-embedding-3` at this app's width, with a small query cache."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._model: TextEmbedding | None = None
+        self._cache: OrderedDict[tuple[int, str], np.ndarray] = OrderedDict()
         self._lock = threading.Lock()
 
     @property
@@ -63,82 +57,94 @@ class Embedder:
 
     @property
     def model_name(self) -> str:
-        return self._settings.embed_model
+        """The model a query at this app's own width actually reaches."""
+        try:
+            return model_for(self._settings.embed_dim)
+        except RemoteEmbedUnavailable:
+            return f"unsupported width {self._settings.embed_dim} (max {MAX_DIM})"
 
     @property
     def ready(self) -> bool:
-        return self._model is not None
+        """Whether embedding can happen at all.
 
-    def warm(self) -> float:
-        """Load the session and run one forward pass. Returns seconds spent.
+        A key, and a width something can produce. Both are configuration, so
+        this answers without a network call — which is what lets `/health` and
+        the capability index ask it on a path where nobody can wait.
 
-        Called from the app lifespan so the first real request does not pay
-        model load — otherwise P100 measures our startup, not our pipeline.
+        It is emphatically not a promise the key *works*. That is only knowable
+        by spending a call, and the callers are already built to survive one
+        failing: rerank falls back to fusion order, extraction to lexical, the
+        grounding gate to not running, capability discovery to word overlap,
+        and a connected store to an honest "my sources are unavailable".
         """
-        started = time.perf_counter()
+        if not self._settings.openai_api_key:
+            return False
+        try:
+            model_for(self._settings.embed_dim)
+        except RemoteEmbedUnavailable:
+            return False
+        return True
+
+    # ---- the cache ------------------------------------------------------
+    #
+    # Only queries, never passages. A question repeats — across a turn's
+    # discovery and its search, across the two turns somebody spends rephrasing
+    # — and repeats are exactly what a round trip should not be paid for twice.
+    # Retrieved passages do not repeat within a turn and caching them would
+    # hold somebody's documents in memory for no benefit.
+
+    def _cached(self, key: tuple[int, str]) -> np.ndarray | None:
         with self._lock:
-            if self._model is None:
-                _register(self._settings)
-                self._model = TextEmbedding(
-                    model_name=self._settings.embed_model,
-                    cache_dir=self._settings.embed_cache_dir,
-                    threads=self._settings.embed_threads,
-                )
-                list(self._model.embed([QUERY_PREFIX + "warm"]))
-        return time.perf_counter() - started
+            vector = self._cache.get(key)
+            if vector is not None:
+                self._cache.move_to_end(key)
+            return vector
 
-    def _embed(self, texts: list[str], batch_size: int) -> np.ndarray:
-        if self._model is None:
-            self.warm()
-        assert self._model is not None
-        vectors = list(self._model.embed(texts, batch_size=batch_size))
-        return np.asarray(vectors, dtype=np.float32)
+    def _remember(self, key: tuple[int, str], vector: np.ndarray) -> None:
+        limit = max(0, self._settings.embed_cache_size)
+        if not limit:
+            return
+        with self._lock:
+            self._cache[key] = vector
+            self._cache.move_to_end(key)
+            while len(self._cache) > limit:
+                self._cache.popitem(last=False)
 
-    def embed_query(self, text: str) -> np.ndarray:
-        return self._embed([QUERY_PREFIX + text], batch_size=1)[0]
+    # ---- embedding ------------------------------------------------------
 
-    def embed_passages(self, texts: list[str], batch_size: int = 64) -> np.ndarray:
+    def embed_query(self, text: str, dim: int | None = None) -> np.ndarray:
+        """One vector, at this app's width or at a store's.
+
+        `dim` is what lets a backend reach its own width through the same
+        client and the same cache instead of holding a second one. A connected
+        index built at 768 cannot be searched with a vector of any other size,
+        and no column mapping reconciles that after the fact.
+        """
+        width = dim or self._settings.embed_dim
+        key = (width, text)
+
+        cached = self._cached(key)
+        if cached is not None:
+            return cached
+
+        vector = embed_texts([text], width, settings=self._settings)[0]
+        self._remember(key, vector)
+        return vector
+
+    def embed_passages(self, texts: list[str], batch_size: int | None = None) -> np.ndarray:
+        """One call for the whole batch.
+
+        `batch_size` is accepted and ignored — it was the ONNX forward-pass
+        batch, and over HTTP the shape that matters is one request rather than
+        many. The signature stays because four callers pass it, and changing
+        them to say nothing would be a bigger diff than honouring a parameter
+        that no longer has anything to tune.
+        """
         if not texts:
             return np.empty((0, self.dim), dtype=np.float32)
-        return self._embed([PASSAGE_PREFIX + t for t in texts], batch_size=batch_size)
-
-    def count_tokens(self, texts: list[str]) -> list[int]:
-        """Real token lengths, padding excluded.
-
-        Chunk sizes are set in tokens, never characters: Indic scripts cost more
-        tokens than equivalent English, and truncation at the model's limit is
-        silent (docs/03-chunking.md).
-
-        `len(encoding.ids)` is the wrong measure here — the tokeniser pads every
-        encoding in a batch out to the longest member, so counting ids reports
-        the batch maximum for every text and makes a corpus of short passages
-        look like it is entirely at the cap. The attention mask is the content.
-        """
-        if self._model is None:
-            self.warm()
-
-        tokenizer = getattr(getattr(self._model, "model", None), "tokenizer", None)
-        if tokenizer is None:
-            return []
-
-        encoded = tokenizer.encode_batch([PASSAGE_PREFIX + t for t in texts])
-        return [sum(e.attention_mask) for e in encoded]
+        return embed_texts(texts, self._settings.embed_dim, settings=self._settings)
 
 
 @lru_cache
 def get_embedder() -> Embedder:
     return Embedder(get_settings())
-
-
-# `get_embedder_for`, `known_models` and `model_dim` lived here: a per-store
-# embedder loaded from HuggingFace, chosen by a model name typed on the form.
-# Both halves were wrong. The form could not help anyone answer the question —
-# the reasonable reply to "stores 768-dimensional vectors" is `768`, which
-# fastembed spent 39 seconds trying to download as a repository — and the
-# widths most connected stores actually use, 1536 and 3072, have no locally
-# loadable model at all.
-#
-# A connected store of another width is now embedded by
-# `src/rag/remote_embed.py`, which asks `text-embedding-3` for exactly the
-# width read from that store's catalogue. Nothing is typed and nothing is
-# downloaded.

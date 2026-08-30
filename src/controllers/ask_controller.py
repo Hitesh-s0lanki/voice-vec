@@ -35,7 +35,7 @@ UserDep = Annotated[str | None, Depends(maybe_user)]
 
 
 # Deliberately `def`, not `async def`: the pipeline is synchronous CPU work
-# (ONNX forward pass, vector search), so FastAPI runs it in the threadpool and
+# (embedding round trips, vector search), so FastAPI runs it in the threadpool and
 # one slow answer cannot stall the event loop.
 @router.post("", response_model=AskResponse, summary="Answer a transcript from the corpus")
 def ask(request: AskRequest, service: AskServiceDep, user_id: UserDep) -> AskResponse:

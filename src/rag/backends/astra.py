@@ -47,28 +47,23 @@ class AstraBackend:
 
 
     def embed_query(self, text: str) -> np.ndarray:
-        """Embedded at *this* store's width, locally when that is ours.
+        """Embedded at *this* store's width, whatever that is.
 
-        A connected index built at another width is embedded remotely, because
-        `text-embedding-3` can be asked for exactly that many dimensions
-        (`src/rag/remote_embed.py`). Nothing was asked on the form and nothing
-        was downloaded — the width came from the store's own catalogue.
+        `text-embedding-3` can be asked for exactly the number of dimensions
+        the store's own catalogue reported, so there is one embedder and one
+        call — the branch that used to pick a local model when the widths
+        happened to agree went with the local model itself
+        (docs/25-no-local-embedder.md).
         """
-        from src.core.config import get_settings
         from src.rag.embed import get_embedder
         from src.rag.remote_embed import RemoteEmbedUnavailable
-        from src.rag.remote_embed import embed_query as embed_remote
-
-        settings = get_settings()
-        if not self._dim or self._dim == settings.embed_dim:
-            return get_embedder().embed_query(text)
 
         try:
-            return embed_remote(text, self._dim, settings=settings)
+            return get_embedder().embed_query(text, dim=self._dim or None)
         except RemoteEmbedUnavailable as error:
             # `StoreUnavailable` is what the ladder already abstains on, so a
-            # provider outage degrades to "my sources are unavailable" rather
-            # than a 500 from a layer nobody can place.
+            # provider outage — or a missing key — degrades to "my sources are
+            # unavailable" rather than a 500 from a layer nobody can place.
             raise StoreUnavailable(str(error)) from error
 
     def _post(self, body: dict[str, Any], *, timeout: float) -> dict[str, Any]:

@@ -23,7 +23,11 @@ classifiers = [
 dependencies = [
     "duckdb>=1.5.5",
     "fastapi>=0.141.1",
-    "fastembed>=0.8.0",
+    # numpy is a direct import all over src/rag/ — it arrived transitively via
+    # fastembed until the local embedder was removed (docs/25-no-local-embedder.md),
+    # and a transitive dependency the code imports by name is one upgrade away
+    # from an ImportError.
+    "numpy>=2.2",
     # Every provider call on the voice path is a streamed one; httpx is the
     # client that does that without buffering the whole body first.
     "httpx>=0.28.1",
