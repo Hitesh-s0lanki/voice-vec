@@ -21,7 +21,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from src.core.config import Settings, get_settings
+from src.core.config import Settings
 from src.rag import remote_embed
 from src.rag.embed import Embedder
 from src.rag.remote_embed import (
@@ -244,31 +244,38 @@ class TestABackendAsksForItsOwnWidth:
     abstains on rather than a 500.
     """
 
-    def _backend(self, dim, monkeypatch, client):
+    def _backend(self, dim, monkeypatch, client, **settings_overrides):
+        """A backend whose embedder is built here, not from the environment.
+
+        `get_embedder` is a module-level singleton over the real `Settings`,
+        which reads `.env`. Left alone, these tests pass on a laptop that has an
+        OPENAI_API_KEY and fail in CI, which is the wrong way round for a test
+        about routing a width.
+        """
         from src.rag.backends.pinecone import PineconeBackend
 
+        settings = _settings(**settings_overrides)
         monkeypatch.setattr(remote_embed, "get_client", lambda: client)
-        return PineconeBackend({"api_key": "k", "index": "i", "dim": str(dim)})
+        monkeypatch.setattr("src.rag.embed.get_embedder", lambda: Embedder(settings))
+        return PineconeBackend({"api_key": "k", "index": "i", "dim": str(dim)}), settings
 
     def test_the_stores_width_is_what_is_requested(self, monkeypatch):
         client = FakeClient()
-        backend = self._backend(768, monkeypatch, client)
+        backend, _ = self._backend(768, monkeypatch, client)
         backend.embed_query("a question")
         assert client.calls[0]["dimensions"] == 768
 
     def test_a_store_with_no_recorded_width_falls_back_to_the_apps(self, monkeypatch):
         client = FakeClient()
-        backend = self._backend(0, monkeypatch, client)
+        backend, settings = self._backend(0, monkeypatch, client)
         backend.embed_query("a question")
-        assert client.calls[0]["dimensions"] == get_settings().embed_dim
+        assert client.calls[0]["dimensions"] == settings.embed_dim
 
     def test_a_missing_key_reads_as_the_store_being_unavailable(self, monkeypatch):
         from src.rag.backends.base import StoreUnavailable
 
-        backend = self._backend(768, monkeypatch, FakeClient())
-        monkeypatch.setattr(
-            "src.rag.embed.get_embedder",
-            lambda: Embedder(_settings(openai_api_key="")),
+        backend, _ = self._backend(
+            768, monkeypatch, FakeClient(), openai_api_key=""
         )
         with pytest.raises(StoreUnavailable) as caught:
             backend.embed_query("a question")
