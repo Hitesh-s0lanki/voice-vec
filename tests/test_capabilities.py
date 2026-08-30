@@ -66,7 +66,7 @@ class FakeCatalogue:
 
 
 class FakeEmbedder:
-    """No ONNX in a unit test — the index falls back to word overlap."""
+    """No embedder in a unit test — the index falls back to word overlap."""
 
     ready = False
 
@@ -121,10 +121,16 @@ class TestTheThresholdIsLiftNotScore:
     """The bug: a store whose card said *finding book passages* did not match
     "summary of the book The Laws of Human Nature".
 
-    It ranked first and was cut by an absolute floor. These are the real
-    cosines from that account, and they are the argument for the rule: the
-    relevant question and the small-talk one score the same to within 0.003,
-    and only their lift over the account's own baseline tells them apart.
+    It ranked first and was cut by an absolute floor. What separates a question
+    a capability covers from one it does not is **lift** — how far the best
+    card sits above the mean of this person's own cards — and not the raw
+    cosine, which moves with the cards.
+
+    The magnitudes below are `text-embedding-3`'s, which spreads cards much
+    further apart than e5 did (docs/25-no-local-embedder.md). The *shape* is
+    what is pinned and it is unchanged by that swap: the irrelevant question
+    here scores **higher** in absolute terms than the relevant one and still
+    matches nothing, which no absolute floor can express.
     """
 
     def _index(self, scores, **overrides):
@@ -151,15 +157,18 @@ class TestTheThresholdIsLiftNotScore:
         return CapabilityIndex(FakeCatalogue(found), Embedder(), settings)
 
     def test_the_book_question_matches_the_book_store(self):
-        """0.797 against a 0.772 baseline — a lift of 0.025."""
-        found = self._index([0.797, 0.788, 0.763, 0.739]).search("u1", "the laws of human nature")
+        """0.30 against a 0.12 baseline — a lift of 0.18, clear of the floor."""
+        found = self._index([0.30, 0.10, 0.05, 0.03]).search("u1", "the laws of human nature")
 
         assert [m.capability.id for m in found] == ["c0"]
 
-    def test_small_talk_scoring_just_as_high_matches_nothing(self):
-        """0.794, which is *higher* than the book question's 0.797 baseline —
-        and a lift of 0.010."""
-        found = self._index([0.794, 0.790, 0.780, 0.776]).search("u1", "how are you feeling today")
+    def test_small_talk_scoring_higher_still_matches_nothing(self):
+        """0.35 — a *higher* top score than the book question's 0.30 — and a
+        lift of 0.038, because every card scores about the same.
+
+        This is the whole argument in one pair: any absolute floor that admits
+        the test above also admits this one."""
+        found = self._index([0.35, 0.32, 0.30, 0.28]).search("u1", "how are you feeling today")
 
         assert found == []
 

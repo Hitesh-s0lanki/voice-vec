@@ -235,10 +235,9 @@ class PgVectorProbe:
     def _match(self, paired: "tuple[str, list[float]] | None", dimensions: int | None) -> float | None:
         """Compare one record against our own embedding of its own text.
 
-        The embedder is chosen the same way `PgVectorBackend.embed_query`
-        chooses it — locally when the widths agree, remotely at the store's
-        width when they do not — because the question is not "can we embed
-        this" but "would the vector we search with land near theirs".
+        Embedded exactly the way `PgVectorBackend.embed_query` does it — at the
+        store's own width — because the question is not "can we embed this" but
+        "would the vector we search with land near theirs".
         """
         if paired is None:
             return None
@@ -246,14 +245,9 @@ class PgVectorProbe:
         text, vector = paired
 
         def embed(value: str):
-            from src.core.config import get_settings
             from src.rag.embed import get_embedder
-            from src.rag.remote_embed import embed_query as embed_remote
 
-            settings = get_settings()
-            if not dimensions or dimensions == settings.embed_dim:
-                return get_embedder().embed_query(value)
-            return embed_remote(value, dimensions, settings=settings)
+            return get_embedder().embed_query(value, dim=dimensions or None)
 
         return embedding_match(vector, text, embed)
 

@@ -79,10 +79,10 @@ class VectorBackend(Protocol):
         metric reconciles that after the fact; the only honest answer is to
         embed with the model that built the index.
 
-        A connected store built at this app's own width returns the local
-        embedding, so this costs nothing in the common case — it is the same
-        embedder, reached through the object that knows whether it is the
-        right one.
+        Every width goes through the one embedder, which asks
+        `text-embedding-3` for exactly this store's number of dimensions. So
+        this is one call whatever the store is — reached through the object
+        that knows what width to ask for.
         """
         ...
 

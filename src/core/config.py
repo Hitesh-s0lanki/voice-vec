@@ -175,14 +175,39 @@ class Settings(BaseSettings):
         return f"{self.frontend_url.rstrip('/')}{self.composio_callback_path}"
 
     # ---- Embedding ------------------------------------------------------
-    # multilingual-e5-small: 384 dims, ONNX, ~3 ms per query on CPU. The ONNX
-    # export lives in the same HF repo as the torch weights (`onnx/model.onnx`).
-    embed_model: str = "intfloat/multilingual-e5-small"
-    embed_dim: int = 384
-    embed_model_file: str = "onnx/model.onnx"
-    # None lets onnxruntime pick. Pin it if batch-of-1 latency looks noisy.
-    embed_threads: int | None = None
-    embed_cache_dir: str = "data/models"
+    # `text-embedding-3`, over the network. There is no local model: the ONNX
+    # session that used to live here held ~700 MiB resident to save a round
+    # trip, and that is not a trade a 512 MiB deployment can make
+    # (docs/25-no-local-embedder.md).
+    #
+    # The width is this app's own — what the question, the reranked passages,
+    # the extraction shortlist and the capability cards are embedded at. It is
+    # free to choose, because nothing persists a vector of this app's making:
+    # every one of those comparisons is between two things embedded in the same
+    # breath. A *connected store's* width is read from its own catalogue and
+    # never from here.
+    #
+    # 1536 is `text-embedding-3-small` native, so no truncation and no quality
+    # left on the table. Drop it to 512 or 768 to move less over the wire per
+    # turn; `remote_embed.MODELS` decides which model serves the width, and
+    # anything above 1536 costs the larger, slower model.
+    embed_dim: int = 1536
+    # Queries only, and bounded. A question repeats — between a turn's
+    # discovery and its search, and across the two turns somebody spends
+    # rephrasing — and a repeat is the one round trip worth not paying twice.
+    embed_cache_size: int = 256
+    # What one embedding call costs, for the stages that price themselves
+    # before running. It is a *per-call* number now, not per-item: over HTTP a
+    # batch of twenty passages is the same one round trip as a batch of one, so
+    # the old `len(candidates) * 8 ms` model priced the wrong thing entirely.
+    #
+    # 600 ms is the middle of the 0.4–2.5 s range measured from ap-southeast-1
+    # (`remote_embed.get_client`). It is deliberately larger than the whole
+    # 200 ms deadline, which is the honest consequence of embedding over a
+    # network: inside a spoken turn the optional stages now mostly decline to
+    # run, and say so, rather than blowing the budget silently. Raise the
+    # deadline or lower this only against a measurement from your own region.
+    embed_call_ms: float = 600.0
 
     # ---- Postgres (src/core/db.py) --------------------------------------
     # This app's own database: conversations, tool calls, connected accounts,
@@ -249,16 +274,30 @@ class Settings(BaseSettings):
     # passages — so a turn pays for the description of a store only when the
     # question might actually be about it.
     capabilities_enabled: bool = True
-    # How far the best card must sit above the mean of *this person's own*
-    # cards. Lift rather than an absolute cosine, because e5 over short cards
-    # sits in a narrow band that moves with the cards: measured on one real
-    # account, "summary of the book The Laws of Human Nature" scored 0.797 and
-    # "how are you feeling today" scored 0.794, while their lifts were 0.027
-    # and 0.010. Across a dozen queries the relevant ones lift 0.027-0.120 and
-    # the irrelevant ones 0.010-0.019, so this sits in that gap. Below it
-    # nothing is returned and the agent says it cannot reach anything that
-    # covers the question, which is the honest answer.
-    capability_min_lift: float = 0.023
+    # Lift, not an absolute cosine: how far the best card sits above the mean
+    # of this person's own cards. An absolute floor cannot work, because where
+    # the band sits moves with the cards.
+    #
+    # **Re-measured for `text-embedding-3`** (docs/25-no-local-embedder.md).
+    # e5 put every card in a narrow band and 0.023 was the gap in it; the new
+    # embedder spreads them much wider, and 0.023 admitted *everything* — all
+    # five of the probe's deliberately-unanswerable queries matched a
+    # capability. Over 21 queries against a four-capability account:
+    #
+    #   relevant     0.075 - 0.485   (nine of eleven above 0.149)
+    #   irrelevant   0.025 - 0.089
+    #
+    # 0.10 sits in that gap with room on both sides. It costs one query —
+    # "summary of the book The Laws of Human Nature" lifts 0.075, because the
+    # card says *book passages* and the question names a title the card has
+    # never seen. That is a card that could be better rather than a threshold
+    # that should be lower: dropping to 0.075 to catch it also admits "sing me
+    # a song" at 0.089.
+    #
+    # Twenty-one hand-written queries is a probe, not a sweep. It is enough to
+    # show 0.023 is broken here and that 0.10 is not; it is not enough to call
+    # 0.10 optimal.
+    capability_min_lift: float = 0.10
     # The fallback's floor, on the fallback's scale: the share of the
     # question's own words that appear in the card, used when the embedder is
     # unavailable. A separate number because it is a separate measurement;
@@ -403,9 +442,21 @@ class Settings(BaseSettings):
     # extracted span can, so every sentence of it is embedded and scored
     # against the sentences of the context it was given. Below this, the answer
     # is not supported by what was retrieved and the pipeline abstains.
-    # Local — the embedder is already loaded — so the gate costs milliseconds,
-    # not a round trip.
-    generation_support_floor: float = 0.62
+    #
+    # **This is a round trip now**, not the milliseconds it was when the model
+    # was local (docs/25-no-local-embedder.md), which is why the gate skips
+    # rather than overruns when the budget cannot hold one.
+    #
+    # Re-measured on `text-embedding-3` over three grounded and three
+    # ungrounded claim/evidence pairs:
+    #
+    #   grounded     0.611 - 0.856
+    #   ungrounded   0.199 - 0.405
+    #
+    # 0.62 was e5's number and sat *above* the lowest genuinely grounded claim
+    # here, so it refused an answer its evidence did support. 0.50 is the
+    # middle of the measured gap. Six pairs is a sanity check, not a sweep.
+    generation_support_floor: float = 0.50
     # How many of the answer's sentences may fall below that floor and still
     # pass. One unsupported clause in a four-sentence answer is a hedge; half
     # of them is a hallucination.
@@ -583,18 +634,6 @@ class Settings(BaseSettings):
     deadline_ms: int = 200
     metrics_buffer: int = 500
 
-    # Warming the embedder once at boot is not enough. Measured on this machine:
-    # after 30 s of no traffic the next request pays ~+30 ms on embed and ~+30 ms
-    # on search, and a cold *answered* request measured 200.3 ms — over budget.
-    # Back-to-back it is 78 ms. The ONNX arena goes cold when nothing touches it,
-    # and a pooled connection idles out too; interactive voice use is all cold
-    # requests:
-    # one question, then minutes of silence.
-    #
-    # So a tiny embed + search runs on this interval to keep both hot. ~12 ms of
-    # work per tick — a 0.06% duty cycle at 20 s. Set 0 to disable and measure
-    # the difference.
-    keepalive_seconds: int = 20
 
     # ---- Resolved providers ---------------------------------------------
 

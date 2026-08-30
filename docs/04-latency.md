@@ -1,5 +1,14 @@
 # 04 — Latency
 
+> [!IMPORTANT]
+> **Superseded in part by [25-no-local-embedder.md](25-no-local-embedder.md).** Every budget
+> below assumes embedding is a local ONNX forward pass costing 15–40 ms. It is a call to
+> `text-embedding-3` now — 0.4–2.9 s measured — because the local model held ~700 MiB
+> resident and the deployment has 512 MiB. The 200 ms figure and the reasoning about where
+> the risk sits are still the design this app was built to; what changed is that the
+> optional stages now *decline* to run inside a spoken turn rather than fitting in it, which
+> is what the budget mechanism described here was for.
+
 > Requirement 3: *"The full process — chunking + vector DB retrieval + everything through to
 > final output — should complete in under 200ms."*
 >

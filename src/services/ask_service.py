@@ -204,16 +204,15 @@ class AskService:
     def _embed(self, run: _Run) -> None:
         """Embed with whatever model can search the store that will answer.
 
-        Through the backend rather than through `self._embedder` directly. A
-        connected store built at this app's own width returns the local
-        embedder, so this costs one call — and for a store built at another
-        width it is the difference between a search and a dimension error on
+        Through the backend rather than through `self._embedder` directly,
+        because the backend is what knows its own width — and asking for the
+        wrong one is the difference between a search and a dimension error on
         every question.
         """
         # `getattr` rather than a direct call: `VectorBackend` is a structural
         # Protocol, so a backend written before this method existed — a test
         # double, an out-of-tree implementation — is still a valid backend. It
-        # gets the local embedder, which is the answer it had before.
+        # gets this app's own width, which is the answer it had before.
         embed = getattr(run.store, "embed_query", None) if run.store else None
         if embed is None:
             embed = self._embedder.embed_query

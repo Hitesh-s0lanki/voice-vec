@@ -33,10 +33,6 @@ env:
   # Fail instead of silently resolving a different dependency set.
   UV_LOCKED: '1'
   FORCE_COLOR: '1'
-  # Named here because the cache key below depends on it: change the model in
-  # src/core/config.py and this has to move with it, or CI restores the wrong
-  # weights and the smoke job downloads on top of them.
-  EMBED_MODEL: intfloat/multilingual-e5-small
 
 jobs:
   lock:
@@ -196,14 +192,6 @@ jobs:
       - name: Install runtime dependencies only
         # No dev group: proves the app boots with just what production installs.
         run: uv sync --locked --no-dev
-
-      - name: Restore the embedding model
-        # ~670 MB from HuggingFace otherwise, on every run. The image bakes it
-        # at build time; here it is cached instead.
-        uses: actions/cache@v4
-        with:
-          path: data/models
-          key: fastembed-${{ env.EMBED_MODEL }}
 
       - name: Boot the server and probe it
         # The venv on PATH, so smoke.sh's plain `uvicorn` is this one.

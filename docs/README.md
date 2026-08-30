@@ -68,7 +68,8 @@ a measured number on thousands of queries rather than a demo that worked once.
 21. **[21-agents.md](21-agents.md)** — one package for the agents, one contract under them, and LangChain under that: what counts as an agent here, the three promises `BaseAgent` holds, the one real tool loop, and the prompt files in [`src/prompts/`](../src/prompts/), and the tools in [`src/tools/`](../src/tools/)
 22. **[22-no-local-corpus.md](22-no-local-corpus.md)** — removing the deployment's own index: what a fallback corpus was hiding, why "nothing connected" is an answer rather than an error, and everything that came out with it
 23. **[23-capabilities.md](23-capabilities.md)** — what the agent can reach, as a tool instead of a prompt: `find_capability` searches the measured cards, and what it names unlocks the tool that acts on it
-24. **[24-deploy.md](24-deploy.md)** — the container and the two pipelines: why the embedding model is baked into the image, what the entrypoint does at boot, and what each CI job actually proves
+24. **[24-deploy.md](24-deploy.md)** — the container and the two pipelines: what the image carries, what the entrypoint does at boot, and what each CI job actually proves
+25. **[25-no-local-embedder.md](25-no-local-embedder.md)** — removing the ONNX model: why 922 MiB resident does not fit a 512 MiB instance, what `text-embedding-3` costs in round trips instead, and the two thresholds that were silently wrong until they were re-measured
 
 ## Background research
 
@@ -105,7 +106,7 @@ Built and working:
 - Composio reachable on either of its two credentials — a platform `ak_` key through the
   SDK, an MCP gateway `ck_` key through JSON-RPC
   ([20-composio-gateway.md](20-composio-gateway.md)): [`src/integrations/mcp.py`](../src/integrations/mcp.py)
-- Retrieval against a *connected* store only — local ONNX embedding, extractive answers,
+- Retrieval against a *connected* store only — `text-embedding-3` embedding, extractive answers,
   Gates 1–3, per-stage timings, live percentiles at `GET /metrics`. Nothing is ingested
   here and nothing falls back to a shared index ([22-no-local-corpus.md](22-no-local-corpus.md))
 - Cross-lingual retrieval — a question in any language against a store indexed in another,

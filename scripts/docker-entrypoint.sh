@@ -35,10 +35,11 @@ case "${1:-serve}" in
         # reload=True, which is a development server. Same app, production
         # server settings.
         #
-        # WEB_CONCURRENCY stays at 1 by default because every worker opens its
-        # own ONNX session and its own warm loop, so a second worker costs the
-        # model's memory again for a server whose bottleneck is upstream
-        # providers rather than local CPU.
+        # WEB_CONCURRENCY stays at 1 by default: this server's work is waiting
+        # on upstream providers rather than burning local CPU, so a second
+        # worker mostly buys another copy of the process. It is now safe to
+        # raise on a box with the memory for it — the ~700 MiB ONNX session
+        # each worker used to load is gone (docs/25-no-local-embedder.md).
         #
         # proxy-headers, because Render and every other platform terminate TLS
         # in front of this and the voice socket needs the real scheme.

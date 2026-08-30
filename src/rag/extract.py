@@ -28,9 +28,6 @@ from src.rag.chunk import Sentence, split_sentences, tokens
 from src.rag.embed import Embedder
 from src.rag.store import Hit
 
-# Rough per-sentence embedding cost, used only to decide whether the rerank
-# fits in the remaining budget. Measured, not guessed — see the module docstring.
-EMBED_MS_PER_WINDOW = 5.0
 
 
 @dataclass(slots=True)
@@ -142,8 +139,10 @@ def extract_span(
     candidates.sort(key=lambda w: (w.lexical, w.hit.score), reverse=True)
     shortlist = candidates[: settings.extract_rerank]
 
-    estimate_ms = len(shortlist) * EMBED_MS_PER_WINDOW
-    if estimate_ms > budget_ms:
+    # One call for the shortlist, so this is the price of a round trip rather
+    # than of six sentences (docs/25-no-local-embedder.md). Falling through
+    # leaves the lexical winner, which is a real answer chosen a worse way.
+    if settings.embed_call_ms > budget_ms:
         best = shortlist[0]
         return Extraction(
             answer=best.text,

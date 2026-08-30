@@ -714,7 +714,7 @@ class _StubEmbedder:
         import numpy as np
 
         if self.fail:
-            raise RuntimeError("onnx session is unwell")
+            raise RuntimeError("the embedding provider is unwell")
 
         vocab = sorted({w for t in texts for w in t.lower().split()})
         rows = []
@@ -828,7 +828,7 @@ class _RecordingCache:
 
 
 def _ladder(store=None, cache=None, **overrides):
-    """An AskService with no database, no network and no ONNX session."""
+    """An AskService with no database and no network of any kind."""
     import numpy as np
 
     from src.rag.backends.resolve import FixedResolver

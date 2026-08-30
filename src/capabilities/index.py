@@ -40,9 +40,11 @@ decide is the honest move; withholding the only thing somebody connected
 because the arithmetic degenerates is not.
 
 **No embedder, still useful.** The fallback is token overlap over the same
-text. It is worse, and it is what runs when the ONNX model is not configured;
-returning nothing there would make the whole flow depend on an optional
-component.
+text. It is worse, and it is what runs when there is no `OPENAI_API_KEY`, or
+when the embedding call fails — which is a live possibility now that embedding
+is a network call rather than a local model (docs/25-no-local-embedder.md).
+Returning nothing there would make the whole flow depend on a component that
+can be down.
 """
 
 from __future__ import annotations

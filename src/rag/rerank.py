@@ -38,10 +38,6 @@ from src.core.config import Settings
 from src.rag.embed import Embedder
 from src.rag.store import Hit
 
-# Passages are longer than the sentences `extract.py` embeds, so the per-item
-# cost is higher: measured around 8 ms each on this machine. Only used to
-# decide whether the stage fits in what is left of the rung's budget.
-EMBED_MS_PER_PASSAGE = 8.0
 
 
 def rerank(
@@ -65,8 +61,11 @@ def rerank(
     candidates = hits[: settings.rerank_candidates]
     keep = max(1, settings.rerank_keep)
 
-    estimate_ms = len(candidates) * EMBED_MS_PER_PASSAGE
-    if estimate_ms > budget_ms:
+    # One call for the batch, so the estimate does not scale with how many
+    # candidates there are — twenty passages and one passage are the same round
+    # trip (docs/25-no-local-embedder.md). What decides this is whether there
+    # is room for *a* call at all.
+    if settings.embed_call_ms > budget_ms:
         return candidates[:keep], "order"
 
     texts = [hit.rendering(english=english)[: settings.extract_max_chars] for hit in candidates]
