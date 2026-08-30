@@ -1,5 +1,6 @@
 import { ClerkProvider } from "@clerk/nextjs";
 import { shadcn } from "@clerk/ui/themes";
+import { Analytics } from "@vercel/analytics/next";
 import type { Metadata, Viewport } from "next";
 import { Fraunces, Manrope, Noto_Sans_Devanagari } from "next/font/google";
 import "./globals.css";
@@ -143,6 +144,12 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
             </TooltipProvider>
           </ConversationProvider>
         </ClerkProvider>
+        {/* Renders nothing — it injects Vercel's script and reports a
+            pageview per route change. Outside the providers because it reads
+            none of their state, and last in the body so the orb paints first.
+            Only reports from a Vercel deployment with Web Analytics enabled;
+            anywhere else the script 404s and the component stays inert. */}
+        <Analytics />
       </body>
     </html>
   );
