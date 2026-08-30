@@ -18,9 +18,6 @@ LOG="$(mktemp -t vec-smoke.XXXXXX)"
 export HOST PORT
 export ENVIRONMENT=ci
 export CORS_ORIGINS='["http://localhost:3002"]'
-export EMBED_CACHE_DIR="${EMBED_CACHE_DIR:-data/models}"
-# Off, so the warm loop cannot keep the process alive past the teardown below.
-export KEEPALIVE_SECONDS=0
 
 cleanup() {
     if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2>/dev/null; then
@@ -37,9 +34,10 @@ echo "==> booting uvicorn on ${HOST}:${PORT}"
 uvicorn src.main:app --host "$HOST" --port "$PORT" > "$LOG" 2>&1 &
 PID=$!
 
-# Generous, because the first boot on a cold runner loads (and possibly
-# downloads) the ONNX embedding model before the socket starts answering.
-for _ in $(seq 1 150); do
+# There is no model to load any more (docs/25-no-local-embedder.md), so this
+# should bind in about a second. The retries are for a slow runner, not for a
+# slow boot.
+for _ in $(seq 1 30); do
     if curl -sf "http://${HOST}:${PORT}/health" -o /tmp/vec-health.json; then
         break
     fi
@@ -54,8 +52,13 @@ echo '==> GET /health'
 curl -fsS "http://${HOST}:${PORT}/health" -o /tmp/vec-health.json
 cat /tmp/vec-health.json
 echo
-grep -q '"embedder_ready":true' /tmp/vec-health.json \
-    || { echo '::error::the embedder did not load'; exit 1; }
+# Not `embedder_ready`: with no OPENAI_API_KEY there is nothing to embed with,
+# and reporting that honestly is exactly what this run is checking. What must
+# be true is that the app booted and answered as itself.
+grep -q '"service":"voice-vec"' /tmp/vec-health.json \
+    || { echo '::error::/health did not answer as this service'; exit 1; }
+grep -qE '"status":"(ok|degraded)"' /tmp/vec-health.json \
+    || { echo '::error::/health reported neither ok nor degraded'; exit 1; }
 
 echo '==> GET /openapi.json'
 curl -fsS -o /tmp/vec-openapi.json -w 'HTTP %{http_code}\n' "http://${HOST}:${PORT}/openapi.json"

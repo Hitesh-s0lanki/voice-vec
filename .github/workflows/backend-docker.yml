@@ -99,9 +99,9 @@ jobs:
           echo "ref=${REGISTRY}/${IMAGE_NAME,,}@${{ steps.push.outputs.digest }}" >> "$GITHUB_OUTPUT"
 
       - name: Report the image size
-        # The ONNX embedding model is baked in, so this image is large by
-        # design (see the prefetch in the Dockerfile). Printed rather than
-        # gated, so a jump that is *not* the model is visible in the log.
+        # Printed rather than gated. The image lost ~670 MB of ONNX weights
+        # and fifteen packages with the local embedder, and a jump back up is
+        # worth seeing in the log rather than discovering on a 512 MiB box.
         env:
           REF: ${{ steps.pin.outputs.ref }}
         run: |
@@ -222,11 +222,19 @@ jobs:
           cat /tmp/health.json
           echo
           # `degraded` is the honest answer on a repository with no provider
-          # key yet, and it is still a 200. What must be true either way is
-          # that the baked ONNX session loaded — if it did not, this image
-          # would be downloading 670 MB on every cold start in production.
-          grep -q '"embedder_ready":true' /tmp/health.json \
-            || { echo '::error::the embedder did not load from the image'; exit 1; }
+          # key yet, and it is still a 200. So the unconditional assertion is
+          # that it answered as itself; `embedder_ready` is only a promise when
+          # a key was actually supplied, and then it *is* one — a true key that
+          # reports no embedder means the width or the model resolution broke.
+          grep -q '"service":"voice-vec"' /tmp/health.json \
+            || { echo '::error::/health did not answer as this service'; exit 1; }
+          if grep -q '^OPENAI_API_KEY=.' "$RUNNER_TEMP/api.env"; then
+            grep -q '"embedder_ready":true' /tmp/health.json \
+              || { echo '::error::OPENAI_API_KEY is set but no embedder is ready'; exit 1; }
+            echo '    embedder ready, as expected with a key set'
+          else
+            echo '    no OPENAI_API_KEY in this run; embedder_ready is expected false'
+          fi
 
           echo '==> GET /openapi.json'
           curl -fsS -o /tmp/openapi.json -w 'HTTP %{http_code}\n' http://127.0.0.1:8000/openapi.json
@@ -349,9 +357,9 @@ jobs:
             exit 0
           fi
 
-          # ENVIRONMENT, HOST, PORT, EMBED_CACHE_DIR and DATASET_DIR are absent
-          # on purpose. The image already pins them, and a copy in Render would
-          # be a second place for them to drift.
+          # ENVIRONMENT, HOST, PORT and DATASET_DIR are absent on purpose. The
+          # image already pins them, and a copy in Render would be a second
+          # place for them to drift.
           MANAGED='DATABASE_URL SARVAM_API_KEY OPENAI_API_KEY REDIS_URL
                    CLERK_JWT_KEY CLERK_PUBLISHABLE_KEY COMPOSIO_ENCRYPTION_KEY
                    AGENT_MEMORY_ENDPOINT AGENT_MEMORY_STORE_ID AGENT_MEMORY_API_KEY

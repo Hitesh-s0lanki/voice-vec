@@ -5,28 +5,20 @@
 #
 #     docker build -t voice-vec .
 #
-# Two stages, so the runtime image carries the virtualenv, the source and the
-# embedding model, but none of the build tooling or lockfile machinery that
-# produced them.
+# Two stages, so the runtime image carries the virtualenv and the source, but
+# none of the build tooling or lockfile machinery that produced them.
 
 ARG PYTHON_VERSION=3.13
 ARG UV_VERSION=0.12.7
 
 # --------------------------------------------------------------------------
-# Stage 1 — builder: resolve the locked dependency set into /app/.venv, and
-# bake the ONNX embedding model beside it.
+# Stage 1 — builder: resolve the locked dependency set into /app/.venv.
 # --------------------------------------------------------------------------
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
 FROM python:${PYTHON_VERSION}-slim AS builder
 
 COPY --from=uv /uv /uvx /usr/local/bin/
-
-# onnxruntime links against libgomp. It is needed here as well as at runtime,
-# because the model prefetch below actually runs a forward pass.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
@@ -53,24 +45,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY src ./src
 COPY scripts ./scripts
 
-# The embedder is loaded *before* the server accepts traffic (the lifespan in
-# src/main.py warms it so P100 measures the pipeline and not our startup). On a
-# container that has never run, "load" means fetching ~670 MB from HuggingFace
-# first — on every cold start, every restart, every scale-out, and inside the
-# platform's health-check window. So it is fetched once here instead, and the
-# forward pass doubles as proof the session actually loads on this image.
-#
-# Build with --build-arg PREFETCH_EMBED_MODEL=0 for a fast local image that
-# downloads the model at boot instead.
-ARG PREFETCH_EMBED_MODEL=1
-ENV EMBED_CACHE_DIR=/app/data/models \
-    HF_HUB_DISABLE_PROGRESS_BARS=1 \
-    PYTHONPATH=/app
-RUN if [ "$PREFETCH_EMBED_MODEL" = "1" ]; then \
-        /app/.venv/bin/python -c "from src.rag.embed import get_embedder; print('embedder warm in %.1fs' % get_embedder().warm())"; \
-    else \
-        echo 'skipping the model prefetch — this image downloads it at boot'; \
-    fi
+# Nothing to prefetch. This used to bake ~670 MB of ONNX weights in, because
+# the lifespan loaded them before accepting traffic and a cold container would
+# otherwise fetch them from HuggingFace inside the platform's health-check
+# window. Embedding is a call to `text-embedding-3` now
+# (docs/25-no-local-embedder.md), so the image carries the source and the
+# virtualenv and nothing else — and a deployment that has 512 MiB to live in
+# can actually run it.
 
 # A checkout that lost the executable bit (Windows, a zip export) would
 # otherwise produce an image whose entrypoint cannot run.
@@ -80,10 +61,6 @@ RUN chmod +x scripts/docker-entrypoint.sh
 # Stage 2 — runtime.
 # --------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim AS runtime
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
 
 # Unprivileged. A fixed uid/gid keeps bind-mounted file ownership predictable.
 RUN groupadd --system --gid 1001 app \
@@ -98,9 +75,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8000 \
     WEB_CONCURRENCY=1 \
     RUN_MIGRATIONS=true \
-    EMBED_CACHE_DIR=/app/data/models \
-    DATASET_DIR=/app/data/datasets \
-    HF_HUB_DISABLE_PROGRESS_BARS=1
+    DATASET_DIR=/app/data/datasets
 
 WORKDIR /app
 
@@ -109,9 +84,6 @@ COPY --from=builder --chown=app:app /app /app
 # One DuckDB file per attached dataset is written here at runtime
 # (docs/18-datasets.md). Ephemeral unless the platform mounts a disk over it —
 # which is the intended shape: a dataset is rebuilt from its source URL.
-# `chown -R` here would rewrite the metadata of every file under
-# /app/data/models and so duplicate ~670 MB into a second layer. COPY already
-# set the ownership; this only has to cover the directories it creates.
 RUN mkdir -p /app/data/datasets && chown app:app /app/data /app/data/datasets
 
 USER app
@@ -126,9 +98,9 @@ EXPOSE 8000
 # misconfigured must be reported as up, or a rolling deploy never completes and
 # the real fault never surfaces.
 #
-# start-period covers the embedder load. It is a warm read off the image layer
-# rather than a download, but an ONNX session still takes seconds to open.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+# start-period is short because boot is short: there is no model to load, so
+# the process is answering about as soon as uvicorn binds.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD ["python", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8000')+'/health',timeout=4).status==200 or exit(1)"]
 
 ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
