@@ -168,7 +168,7 @@ pydantic-core==2.46.4
     # via pydantic
 pydantic-settings==2.15.0
     # via voice-vec
-pyjwt==2.13.0
+pyjwt==2.15.0
     # via voice-vec
 pysher==1.0.8
     # via composio
